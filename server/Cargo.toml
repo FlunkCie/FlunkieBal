@@ -2,6 +2,7 @@
 name = "flunkiebal-server"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
 description = "Authoritative server for FlunkieBal online matches: runs every match, keeps rooms, seats and logs."
 
 [dependencies]
