@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="pitch_night">#12201A</color>
+    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar.Fullscreen">
+        <item name="android:windowBackground">@color/pitch_night</item>
+        <item name="android:statusBarColor">@color/pitch_night</item>
+        <item name="android:navigationBarColor">@color/pitch_night</item>
+    </style>
+</resources>

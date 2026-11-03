@@ -1,0 +1,12 @@
+/target
+/server/target
+/dist
+/dist-art
+/android/.gradle
+/android/build
+/android/app/build
+/android/local.properties
+*.iml
+.idea/
+/core/target
+flunkiebal-data.json*

@@ -1,0 +1,69 @@
+# FlunkieBal
+
+A mobile game of flunkyball (the Dutch park drinking game: knock the bottle over, then drink
+while the other team runs), made for **FlunkCie** — the official FlunkyBal committee of
+AEGEE-Amsterdam — https://flunkcie.nl. Rules, locations and tone follow FlunkCie.
+
+Rust + wgpu + egui (eframe 0.37), runs natively on the desktop and on Android, and in the browser
+(WebAssembly/WebGL2). Online matches run on a central server.
+
+## Layout
+- `core/` – crate shared by game and server (re-exported as `crate::game`, `crate::anim`):
+  - `core/src/game.rs` – rules, ball physics, referee, CPU players, drills, tutorial, events (`Ev`, worded per screen by `Game::word`)
+  - `core/src/anim.rs` – procedural animation (gait, turning springs, throw, sip, sit, cheer …)
+  - `core/src/proto.rs` – online messages, snapshots, and the mirror (`apply_snapshot`, `mirror_tick`, prediction in `Pred`)
+- `src/app.rs` – `FlunkiApp`: screens/state, input (flick to throw), camera (incl. the fly-through door between clubhouse and training hall), online glue (`net_poll`), `debug_cmds`
+- `src/ui.rs` – all egui screens, sheets, HUD; style/fonts in `setup_style`; screens are pinned to the phone's safe area
+- `src/scene.rs` – per-frame 3D draw list: people (skinned model + leg IK), props, Vondelpark set (trees, bushes, grass)
+- `src/arenas.rs` – arenas (Vondelpark and its evening version, which shares the scenery; Roof, Café, Duplex, Krakau Hostel, training hall, clubhouse) and their `Look` (sun, ambient, up to 6 lamps, rooms for corner darkening)
+- `src/model.rs` – loads `assets/person.glb` (Quaternius, quantized) and poses its bones
+- `src/gfx.rs` + `src/shader.wgsl` + `src/blit.wgsl` – renderer (offscreen pass inside an egui paint callback)
+- `src/net.rs` – the client's connection: socket (browser `WebSocket` on the web, tungstenite on its own thread on desktop and Android), heartbeat, round trip, reconnecting, link state
+- `server/` – `flunkiebal-server` (tokio-tungstenite, default port 8787): `hub.rs` owns rooms and sockets on one task, `room.rs` seats, pausing and the match, `log.rs` logging; `tests/online.rs` plays bots against the real binary
+- `src/android.rs` – what only Android can do, over JNI to `MainActivity`: speech, vibration, notch insets, text prompt, leaving; Vulkan-or-GLES choice
+- `src/social.rs` – friends on the client: a second connection, open while the game runs; server side in `server/src/social.rs`
+- `src/save.rs` (localStorage `flunkiebal-save`; `save.json` on Android; not kept on desktop), `src/audio.rs` (one score played by Web Audio, or by our own synth, on AAudio on Android and cpal on the desktop), `src/voice.rs` (speech + vibration), `src/chalk.rs` (3D chalk text on the clubhouse board)
+- `web/` – page shell (`index.html`) and `make_page.py` (single-file page with the glue inlined)
+- `android/` + `build-android.sh` – Gradle project (`nl.flunkcie.flunkiebal`, min Android 8): a `NativeActivity` subclass around `libflunkiebal.so`, which Gradle builds by running the script
+
+## Build & run
+- Native: `cargo run --release`
+- Web: `./build-web.sh` (needs `rustup target add wasm32-unknown-unknown` and
+  `cargo install wasm-bindgen-cli --version 0.2.130` – must match Cargo.lock), then
+  `python3 -m http.server -d dist 8000`
+- Android: open `android/` in Android Studio, or `cd android && gradle assembleDebug`; needs the NDK and `rustup target add aarch64-linux-android x86_64-linux-android`. `FLUNKI_ABIS=x86_64` builds just the emulator's library
+- Server: `cd server && cargo run --release -- 8787`. The game always connects to `wss://flunkiebal.flunkcie.nl` (`save::SERVER`, no setting); `FLUNKI_SERVER=ws://127.0.0.1:8787` points the desktop build at your own. `FLUNKI_LOG=debug` also logs throws, hits and fouls. Docker: `docker build -f server/Dockerfile -t flunkiebal-server .` from the repository root, or `docker compose up -d --build` (`compose.yaml`: the server, plus the web version from `web/Dockerfile` on port 7878, whose nginx also passes websockets on to the server, so the domain's TLS proxy can point at 7878 alone; restarts on its own, data on the `flunkiebal-data` volume)
+- Tests: `cargo test --release --lib` (includes a check that both shaders validate and translate to GLSL ES 3.0 for WebGL2), `cd core && cargo test --release` (rules, mirror, prediction), `cd server && cargo test --release` (real server, bots on websockets; ~40 s)
+
+## Things that bite
+- **WebGL2 is the baseline.** No base-vertex draws (mesh indices are baked global), keep WGSL translatable (the shader test catches most of it); no derivatives inside material branches (non-uniform control flow).
+- **Firefox** is forced onto WebGL (`lib.rs`); browser APIs that may be missing (e.g. `navigator.vibrate` on desktop Firefox) must be called via `js_sys::Reflect`, never directly through web-sys, or a JS exception kills the frame loop.
+- **Depth is reversed-Z** (infinite far, clear 0, `GreaterEqual`); the shadow pass is standard depth. Shadows come from the sun (ortho) or, when `Look.spot`, from lamp 0 (perspective, the clubhouse bulb).
+- **Shader materials** are picked by `params.x` (see `gfx::kind` and the header of `shader.wgsl`): 0 lit, 1 unlit, 2 soft, 3 lawn, 5 sky, 6 water, 7 ball, 8 wood, 9 pavers, 10 dance floor, 11 facades, 12 brick, 13 bark, 14 leaves, 15 grass blades, 16 plaster, 17 asphalt. Fine patterns fade with `footprint()/resolve()` to avoid moiré.
+- **Clubhouse + training hall are one building** (`build_clubhouse`: hall at the origin, shed moved by `HUB_O`). Hub lamps use slots 0–1, hall lamps 2–5 so `arenas::blend` can keep both. Indoor walls are "dollhouse" walls (drawn only from inside) – except the shared shed/hall wall.
+- **egui fonts**: never animate a font size (each new size re-rasterizes glyphs → stutter).
+- **Phone keyboard**: on the web egui's hidden text input is focused from JS during the tap (`flunki_text_hit` + `tryFocus` in the page). On Android text doesn't reach egui at all: tapping a `text_field` opens a system prompt (`MainActivity.askText`) and the answer is fed in as typed events.
+- **Notch/punch hole**: safe insets come from CSS `env()` on the web and `MainActivity.insets()` on Android.
+- **Android activity recreation**: `NativeActivity.onDestroy` waits for the game's thread, which never ends: without care that's a permanent freeze on the splash screen. So every configuration change is declared in the manifest, and `MainActivity.onDestroy` ends the process.
+- **Android rendering**: pick one wgpu backend up front (`android::backends`); with both on, Vulkan attaches to the window and GLES then fails with BadAlloc. MSAA is off on GLES: the emulator's GLES draws nothing with it. wgpu hides the emulator's Vulkan as non-compliant (and its driver crashes if forced), so **the emulator only ever tests GLES**.
+- **Icons** are glyphs of the bundled Phosphor font (`core/src/icons.rs`, add new ones there), never emoji; system fonts (`system_fonts`) are only for emoji people type themselves.
+- **Online is server-authoritative.** The server ticks the real `Game` at 60 Hz and sends full 20 Hz snapshots; every screen, the host's too, is a mirror (`game.mirror`). "Host" only means who runs the lobby, and it passes on when they go. Bump `proto::PROTOCOL` when messages change: old clients get told to update.
+- **Prediction**: a screen shows its own throw, drink and pad taps at once; `apply_snapshot` keeps them until the snapshot's `a` acknowledges that input. Sounds on a mirror come from snapshots (`Game::sfx` is off there), except predicted ones, which are skipped when the server's arrive.
+- **Latency allowances on the server**: `stop_grace` extends the STOP window by the team's round trip, tap times come from the device (`tap_ms`) so network bursts don't trip the autoclicker check.
+- **A dropped player** pauses the match (15 s per drop, 40 s per person per match), then teammates or the computer cover (`owner_of`, `sides_changed`). Their seat is kept 120 s; the client reconnects with its token (`Resume`). Silent for 4 s counts as dropped. An idle thrower is thrown for after 30 s.
+- **Friends** have no sign-up: the server issues a friend code and a secret, kept in the save per server. A wrong secret gets a new account, never the old one. Everything is in one file on the server (`FLUNKI_DATA`, default `flunkiebal-data.json`, relative to where it runs), which holds messages unencrypted. Stats between two accounts (`Pair`) are kept there too, filed when a room reaches the end of a match; new fields in that file need a serde default, or an old file won't load.
+- **Logging in**: on the web (`save::needs_login`; `FLUNKI_LOGIN=1` on the desktop) there's no device account: you log in or sign up with a username and password (`Register`/`Login`, argon2 on a blocking thread, results come back to the hub as events), and the session is the friend code + secret in the save, resumed with `SHello { only: true }` (a gone session gets `AuthErr`, never a new account). Logged out (`Save::locked`) nothing is earned or kept, the player can't be customized, and online and friends show the login form. On Android it's optional: signing up gives the phone's own account a password (same code, friends kept); logging in to another account keeps the phone's own in `Save.device` for when you log out. Logged in (`Save::logged_in`), the username as typed is the player's name (the server keeps it as the account's name), and the progression (`save::Progress`: look, XP, last 100 matches, records, tutorial) is kept on the server as an opaque string with a `rev`; the newer side wins after logging in. Web progress from before logins is kept in `Save.legacy` for the first account signed up there. Add new text fields' prompts in `MainActivity.showPrompt`. Debug: `signup:user,pass`, `login:user,pass`, `logout`.
+- **Quick messages and emotes** unlock with level (`save::UNLOCKS`; anything not listed is free). That's checked on the sender's screen only, like all cosmetics.
+- **Emotes** (`anim::EMOTES`, `emote_pose`, `scene::emote_prop`) exist only on screens: `Anim.emote` isn't in snapshots, the server just passes `Emote` on, and the match can't be affected. Any match action on that player ends it.
+- **Lighting**: the scene renders to `Rgba16Float` where the device allows (`Gfx::hdr`), followed by a bloom chain (`bloom.wgsl`) and the film curve and grading in `blit.wgsl`; otherwise it falls back to tone-mapping in `shader.wgsl`. `Look.grade[3]` is indoor haze: > 0 turns on per-lamp in-scattered light in the air (`airlight`) and floor bounce. Indoors, keep `ambient` low and let `spot` lamp 0 cast the shadows.
+- Dynamic resolution lowers the 3D render scale when the frame rate drops, in steps (`SCALE_STEPS`) and only after a while: every new size rebuilds all render targets (the old ones are destroyed at once; left to the browser they ran WebGL out of memory).
+- **Web builds and caches**: `index.html` asks for `flunkiebal.js?v=<hash>` and the `.wasm` likewise (`__BUILD__`, filled in by `build-web.sh` and `web/Dockerfile`), nginx sends `no-cache`; if glue and wasm still don't match (`flunkiStale` in the page), it fetches all three fresh and reloads, once a minute at most.
+- Levels have no cap; unlocks stop at `save::TOP_UNLOCK` (10).
+
+## Testing in a browser
+`window.flunki_cmd("cmd:arg")` drives the app (see `debug_cmds` in `app.rs`), e.g. `menu`, `club`,
+`cpu`, `arena:cafe`, `drill:drink`, `host`, `join:CODE`, `start`, `netdrop` (break the connection), `ff:10` (fast-forward), `cam:px,py,pz,lx,ly,lz` / `cam`
+(free camera / reset), `scale:1` (pin render scale), `hide:12,13` (hide meshes), `fps`, `state`.
+Headless Chromium (Playwright, SwiftShader) works but is slow: wait several seconds per screenshot.
+The desktop build takes the same commands, one per line on stdin, with `FLUNKI_STDIN=1 cargo run --release`; `state` prints to stdout.
+On Android: `adb shell "run-as nl.flunkcie.flunkiebal sh -c 'echo state > files/cmds'"`; output goes to logcat (tag `flunkiebal`).

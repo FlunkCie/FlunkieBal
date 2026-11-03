@@ -1,0 +1,42 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'nl.flunkcie.flunkiebal'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'nl.flunkcie.flunkiebal'
+        minSdk 26
+        targetSdk 34
+        versionCode 9
+        versionName '0.9'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            // sign with your own key: Build > Generate Signed App Bundle / APK in Android Studio
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    // the game itself: native libraries from ../build-android.sh
+    sourceSets {
+        main.jniLibs.srcDirs = ["$buildDir/rustLibs"]
+    }
+    packagingOptions {
+        jniLibs.useLegacyPackaging = false
+    }
+}
+
+def buildRust = tasks.register('buildRust', Exec) {
+    workingDir "$rootDir/.."
+    commandLine 'sh', 'build-android.sh', "$buildDir/rustLibs"
+}
+preBuild.dependsOn buildRust

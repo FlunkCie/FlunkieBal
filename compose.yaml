@@ -1,0 +1,44 @@
+# The online server and the web version, kept running: `docker compose up -d --build` from the repository root.
+# Restarts on crashes and after a reboot (as long as the Docker daemon starts at boot).
+# The game always connects to wss://flunkiebal.flunkcie.nl: point that domain's TLS proxy at port 7878
+# (the page, and websockets passed on to the server) or straight at 8787 for the server alone.
+services:
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: flunkiebal-server
+    restart: unless-stopped
+    # tini as PID 1, so `docker compose down` stops the server at once instead of after 10 s
+    init: true
+    ports:
+      - "8787:8787"
+    environment:
+      FLUNKI_DATA: /data/flunkiebal-data.json
+      # FLUNKI_LOG: debug   # also log throws, hits and fouls
+    volumes:
+      # friends, messages and pair stats
+      - flunkiebal-data:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # the web version on http://<host>:7878, which also passes websockets on to the server
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    image: flunkiebal-web
+    restart: unless-stopped
+    ports:
+      - "7878:80"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  flunkiebal-data:

@@ -1,0 +1,59 @@
+[package]
+name = "flunkiebal"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "flunkiebal"
+path = "src/main.rs"
+
+[dependencies]
+flunkiebal-core = { path = "core" }
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "x11"] }
+egui = "0.37"
+egui-wgpu = "0.37"
+bytemuck = { version = "1", features = ["derive"] }
+glam = { version = "0.30", features = ["bytemuck"] }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+# tungstenite leaves the choice of crypto to us; without one, every wss:// connection panics
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+# the desktop: sound through the system, emoji from the system's fonts
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
+cpal = "0.16"
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "system_fonts", "x11"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.37", default-features = false, features = ["wgpu", "default_fonts", "system_fonts", "android-native-activity"] }
+android-activity = { version = "0.6", features = ["native-activity"] }
+android_logger = "0.15"
+jni = "0.21"
+pollster = "0.4"
+ndk = { version = "0.9", features = ["audio", "api-level-26"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["webgl", "webgpu", "wgsl"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window","Document","HtmlCanvasElement","Element","Storage","AudioContext","AudioContextState","OscillatorNode","GainNode","AudioParam","AudioDestinationNode","AudioNode","AudioBuffer","AudioBufferSourceNode","BiquadFilterNode","BiquadFilterType","OscillatorType","AudioScheduledSourceNode","BaseAudioContext","Performance","console","SpeechSynthesis","SpeechSynthesisUtterance","SpeechSynthesisVoice","Navigator","WebSocket","MessageEvent","CloseEvent","BinaryType"] }
+console_error_panic_hook = "0.1"
+js-sys = "0.3"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+
+[dev-dependencies]
+naga = { version = "30", features = ["wgsl-in", "glsl-out"] }
