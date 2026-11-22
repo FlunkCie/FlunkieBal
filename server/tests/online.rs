@@ -57,7 +57,6 @@ struct Bot {
     members: Vec<Member>,
     phase: u8,
     notices: Vec<String>,
-    n: u32,
     rejects: Vec<String>,
     err: Option<String>,
     closed: Option<String>,
@@ -74,14 +73,15 @@ async fn open(url: &str) -> Ws {
 }
 impl Bot {
     async fn new(url: &str) -> Bot {
-        Bot { ws: open(url).await, g: Game::new(1), id: 0, code: String::new(), token: String::new(), members: vec![], phase: 0, notices: vec![], n: 0, rejects: vec![], err: None, closed: None, hb: Instant::now() }
+        Bot { ws: open(url).await, g: Game::new(1), id: 0, code: String::new(), token: String::new(), members: vec![], phase: 0, notices: vec![], rejects: vec![], err: None, closed: None, hb: Instant::now() }
     }
     async fn send(&mut self, m: ToServer) {
         let _ = self.ws.send(Message::Text(serde_json::to_string(&m).unwrap().into())).await;
     }
+    /// Counted as the app counts: in the mirror's `Pred`, which carries on into the next match.
     async fn input(&mut self, i: Input) {
-        self.n += 1;
-        let n = self.n;
+        self.g.pred.sent_n += 1;
+        let n = self.g.pred.sent_n;
         self.send(ToServer::Input { n, i }).await;
     }
     /// Handle everything that arrives for this long, with heartbeats like a phone's.
@@ -153,12 +153,13 @@ async fn play_out(s: &Server, a: &mut Bot, b: &mut Bot) {
             bot.run(0.03).await;
             let g = &bot.g;
             let me = g.my_team.unwrap();
+            let d = &g.teams[me].dc[g.teams[me].lead(g.my_players[me]).unwrap_or(0)];
             if g.local_aiming() {
                 let i = bot.throw_spec();
                 bot.input(i).await;
-            } else if g.can_drink(me) && !g.teams[me].dc.hold && g.teams[me].dc.cough <= 0.0 && g.teams[me].dc.p < 0.3 {
+            } else if g.can_drink(me) && !d.hold && d.cough <= 0.0 && d.p < 0.3 {
                 bot.input(Input::Drink { hold: true, at: t0.elapsed().as_secs_f64() * 1000.0 }).await;
-            } else if g.teams[me].dc.hold && g.teams[me].dc.p > 0.6 {
+            } else if d.hold && d.p > 0.6 {
                 bot.input(Input::Drink { hold: false, at: t0.elapsed().as_secs_f64() * 1000.0 }).await;
             } else if g.can_run(me) {
                 foot = 1 - foot;
@@ -203,6 +204,26 @@ async fn whole_match_with_bots() {
     // …and the others followed
     b.run(0.4).await;
     assert_ne!(b.g.state, State::Over);
+    // the next match takes their throws too
+    let t0 = Instant::now();
+    let mut thrown = false;
+    while !thrown {
+        assert!(t0.elapsed().as_secs() < 15, "nobody could throw in the next match\n{}", s.dump());
+        for bot in [&mut a, &mut b, &mut c] {
+            bot.run(0.03).await;
+            if bot.g.local_aiming() && !thrown {
+                let t = bot.g.turn;
+                let before = bot.g.teams[t].throws;
+                let i = bot.throw_spec();
+                bot.input(i).await;
+                bot.run(0.6).await;
+                assert!(bot.rejects.is_empty(), "{:?}", bot.rejects);
+                assert_eq!(bot.g.teams[t].throws, before + 1, "the server took the throw");
+                assert_ne!(bot.g.state, State::Aim);
+                thrown = true;
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -324,6 +345,8 @@ struct Pal {
     name: String,
     progress: Option<(u64, String)>,
     auth_err: Option<String>,
+    notes: Vec<Note>,
+    latest: Option<u32>,
 }
 impl Pal {
     async fn login(url: &str, code: &str, secret: &str, name: &str) -> Pal {
@@ -334,7 +357,7 @@ impl Pal {
         p
     }
     async fn open(url: &str) -> Pal {
-        Pal { ws: open(url).await, code: String::new(), secret: String::new(), friends: vec![], requests: vec![], sent: vec![], said: vec![], history: vec![], invites: vec![], err: None, user: String::new(), name: String::new(), progress: None, auth_err: None }
+        Pal { ws: open(url).await, code: String::new(), secret: String::new(), friends: vec![], requests: vec![], sent: vec![], said: vec![], history: vec![], invites: vec![], err: None, user: String::new(), name: String::new(), progress: None, auth_err: None, notes: vec![], latest: None }
     }
     /// Send a login or sign-up and wait for the answer (hashing takes a moment).
     async fn auth(&mut self, m: ToServer) {
@@ -369,12 +392,26 @@ impl Pal {
                     FromServer::Said { with, m } => self.said.push((with, m)),
                     FromServer::History { msgs, .. } => self.history = msgs,
                     FromServer::Invited { name, room, .. } => self.invites.push((name, room)),
+                    FromServer::Note { note } => self.notes.push(note),
+                    FromServer::Latest { build } => self.latest = Some(build),
                     FromServer::SocialErr { msg } => self.err = Some(msg),
                     _ => {}
                 }
             }
         }
     }
+}
+
+/// A phone's background check, over plain HTTP like the app's: (status, body).
+async fn notes_check(s: &Server, code: &str, secret: &str, after: u64) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let body = serde_json::to_string(&NotesReq { code: code.into(), secret: secret.into(), after }).unwrap();
+    let mut t = TcpStream::connect(s.url.trim_start_matches("ws://")).await.unwrap();
+    t.write_all(format!("POST {NOTES_PATH} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+    let mut res = String::new();
+    tokio::time::timeout(Duration::from_secs(5), t.read_to_string(&mut res)).await.unwrap().unwrap();
+    let st = res.split_whitespace().nth(1).and_then(|x| x.parse().ok()).unwrap_or(0);
+    (st, res.split_once("\r\n\r\n").map_or(String::new(), |x| x.1.to_string()))
 }
 
 #[tokio::test]
@@ -433,7 +470,13 @@ async fn friends_from_request_to_invite() {
     a.send(ToServer::Invite { to: b.code.clone(), room: host.code.clone() }).await;
     b.run().await;
     assert_eq!(b.invites, vec![("Anna".to_string(), host.code.clone())]);
-    // Bram goes offline: Anna sees it, and her message waits for him
+    assert_eq!(b.latest, Some(APP_BUILD), "every connection hears the newest build first");
+    // …and as a notification, for a game in the background (the message before it was one too)
+    let n = b.notes.last().unwrap();
+    assert_eq!((n.kind, n.name.as_str(), n.room.as_str()), (NOTE_INVITE, "Anna", host.code.as_str()));
+    assert_eq!(b.notes.iter().filter(|n| n.kind == NOTE_MSG).count(), 1);
+    let seen = n.id;
+    // Bram goes offline: Anna sees it, and her invite and message wait for him
     let (bc, bs) = (b.code.clone(), b.secret.clone());
     drop(b);
     a.run().await;
@@ -441,9 +484,23 @@ async fn friends_from_request_to_invite() {
     assert!(!a.friends[0].online);
     a.send(ToServer::Invite { to: bc.clone(), room: host.code.clone() }).await;
     a.run().await;
-    assert!(a.err.take().unwrap().contains("offline"));
+    assert!(a.err.is_none(), "offline friends can be invited: {:?}", a.err);
     a.send(ToServer::Say { to: bc.clone(), text: "while you were out".into() }).await;
     a.run().await;
+    // his phone's background check finds them, newer than what it has shown
+    let (st, r) = notes_check(&s, &bc, &bs, seen).await;
+    assert_eq!(st, 200);
+    let r: NotesResp = serde_json::from_str(&r).unwrap();
+    assert_eq!(r.build, APP_BUILD);
+    assert_eq!(r.notes.iter().map(|n| (n.kind, n.text.as_str())).collect::<Vec<_>>(), vec![(NOTE_INVITE, ""), (NOTE_MSG, "while you were out")]);
+    assert_eq!(notes_check(&s, &bc, "wrong", 0).await.0, 403, "only with the secret");
+    // back in the game, the invite is waiting for him, once
+    let b2 = Pal::login(&s.url, &bc, &bs, "Bram").await;
+    assert_eq!(b2.invites, vec![("Anna".to_string(), host.code.clone())]);
+    drop(b2);
+    let b3 = Pal::login(&s.url, &bc, &bs, "Bram").await;
+    assert!(b3.invites.is_empty(), "{:?}", b3.invites);
+    drop(b3);
     // everything survives a server restart
     let (ac, asec) = (a.code.clone(), a.secret.clone());
     drop(a);
@@ -552,6 +609,9 @@ async fn matches_count_for_stats_between_friends() {
     let (at, bt) = (a.g.my_team.unwrap(), b.g.my_team.unwrap());
     let (ah, bh) = (a.g.teams[at].hits, b.g.teams[bt].hits);
     tokio::time::sleep(Duration::from_millis(200)).await;
+    // a long match: their friends connections, quiet all along, may have been dropped; log in again
+    let mut pa = Pal::login(&s.url, &pa.code, &pa.secret, "Anna").await;
+    let mut pb = Pal::login(&s.url, &pb.code, &pb.secret, "Bram").await;
     // both sides see it, each from their own side
     let mut views = vec![];
     let (ca, cb) = (pa.code.clone(), pb.code.clone());
@@ -667,3 +727,71 @@ async fn accounts_with_a_password_keep_progress() {
 }
 /// More than a connection may try in a minute.
 const AUTH_TRIES: usize = 11;
+
+#[tokio::test]
+async fn bug_reports_are_kept() {
+    let s = Server::start(18800);
+    let path = std::env::temp_dir().join("flunkiebal-bugs.jsonl");
+    let mut p = Pal::open(&s.url).await;
+    let said = |t: &str| serde_json::from_str::<FromServer>(t).ok();
+    let mut answers = vec![];
+    for text in ["", "the ball went sideways 18800", "two", "three", "four"] {
+        p.send(ToServer::Bug { v: PROTOCOL, text: text.into(), info: "build 10, web".into() }).await;
+        for _ in 0..20 {
+            if let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_millis(100), p.ws.next()).await {
+                if let Some(FromServer::BugSaved { ok, .. }) = said(&t) {
+                    answers.push(ok);
+                    break;
+                }
+            }
+        }
+    }
+    assert_eq!(answers, vec![false, true, true, true, false], "nothing to say, then three, then wait a while");
+    let kept = std::fs::read_to_string(&path).unwrap();
+    let line = kept.lines().find(|l| l.contains("sideways 18800")).expect("kept");
+    let v: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(v["info"], "build 10, web");
+    assert!(s.logged("bug report from"), "{}", s.dump());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Not part of the suite: a bot that joins a room on a running server and plays, to test a phone
+/// against. `FLUNKI_URL=ws://127.0.0.1:8790 FLUNKI_JOIN=ABCD FLUNKI_SECS=300 cargo test --release
+/// --test online bot_for_a_phone -- --ignored --nocapture`
+#[tokio::test]
+#[ignore]
+async fn bot_for_a_phone() {
+    let url = std::env::var("FLUNKI_URL").unwrap_or_else(|_| "ws://127.0.0.1:8787".into());
+    let code = std::env::var("FLUNKI_JOIN").expect("FLUNKI_JOIN=<room code>");
+    let secs: u64 = std::env::var("FLUNKI_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    let mut b = Bot::new(&url).await;
+    b.send(ToServer::Join { v: PROTOCOL, code, name: "Bot".into(), look: [0; 7], me: Default::default() }).await;
+    b.run(0.5).await;
+    println!("joined as {} ({:?})", b.id, b.err);
+    let t0 = Instant::now();
+    let mut foot = 0;
+    let mut last = (u32::MAX, State::Menu);
+    while t0.elapsed().as_secs() < secs {
+        b.run(0.05).await;
+        let g = &b.g;
+        if (g.pred.match_id, g.state) != last {
+            last = (g.pred.match_id, g.state);
+            println!("{:>6.1}s match={} state={:?} turn={} throws={:?} beers={:?}/{:?} rejects={:?}", t0.elapsed().as_secs_f32(), g.pred.match_id, g.state, g.turn, [g.teams[0].throws, g.teams[1].throws], g.teams[0].beers, g.teams[1].beers, b.rejects);
+        }
+        let Some(me) = g.my_team else { continue };
+        let d = &g.teams[me].dc[g.teams[me].lead(g.my_players[me]).unwrap_or(0)];
+        let at = t0.elapsed().as_secs_f64() * 1000.0;
+        if g.local_aiming() {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let i = b.throw_spec();
+            b.input(i).await;
+        } else if g.can_drink(me) && !d.hold && d.cough <= 0.0 && d.p < 0.3 {
+            b.input(Input::Drink { hold: true, at }).await;
+        } else if d.hold && d.p > 0.6 {
+            b.input(Input::Drink { hold: false, at }).await;
+        } else if g.can_run(me) {
+            foot = 1 - foot;
+            b.input(Input::Pad { foot, at }).await;
+        }
+    }
+}

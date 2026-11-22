@@ -3,11 +3,11 @@
 //! Where logging in is needed (`save::needs_login`) it's also the way in: a login or sign-up, then the
 //! session kept in the save; logged out, it stays closed.
 
-use crate::net::{ChatMsg, Friend, FromServer, PairStats, Socket, ToServer, PROTOCOL};
+use crate::net::{ChatMsg, Friend, FromServer, Note, PairStats, Socket, ToServer, PROTOCOL};
 use std::collections::HashMap;
 
 /// Nothing from the server for this long: the connection is dead, whatever the socket says.
-const DEAD_AFTER: f64 = 30.0;
+const DEAD_AFTER: f64 = 12.0;
 const PING_EVERY: f64 = 10.0;
 /// An invite you don't answer goes away.
 const INVITE_FOR: f64 = 60.0;
@@ -64,6 +64,14 @@ pub struct Social {
     auth_sent: Option<f64>,
     pub auth_err: String,
     pub user: String,
+    /// the newest build of the game there is, as the server says (0: not heard yet)
+    pub latest: u32,
+    /// notifications that came in, for the app to show
+    pub notes: Vec<Note>,
+    /// a bug report on its way, and the server's answer: (kept, why not)
+    pub bug_busy: bool,
+    pub bug_res: Option<(bool, String)>,
+    bug_at: f64,
 }
 
 impl Social {
@@ -73,6 +81,16 @@ impl Social {
                 s.send(&t);
             }
         }
+    }
+    /// A bug report: on this connection whether logged in or not, it's there as long as the game runs.
+    pub fn send_bug(&mut self, now: f64, text: String, info: String) -> bool {
+        let Some(s) = self.sock.as_ref().filter(|s| s.state() == 1) else { return false };
+        let Ok(t) = serde_json::to_string(&ToServer::Bug { v: PROTOCOL, text, info }) else { return false };
+        s.send(&t);
+        self.bug_busy = true;
+        self.bug_res = None;
+        self.bug_at = now;
+        true
     }
     pub fn unread(&self) -> u32 {
         self.friends.iter().map(|f| f.unread).sum()
@@ -112,7 +130,7 @@ impl Social {
         if let Some(s) = self.sock.take() {
             s.close();
         }
-        *self = Social { url: std::mem::take(&mut self.url), ..Default::default() };
+        *self = Social { url: std::mem::take(&mut self.url), latest: self.latest, ..Default::default() };
     }
     /// Keep connected, take in news. `only`: log in with a password or a kept session, never get a new
     /// account by just connecting; logged out, stay closed.
@@ -122,16 +140,21 @@ impl Social {
             // another server knows other people
             *self = Social { url: url.into(), ..Default::default() };
         }
+        if self.bug_busy && now - self.bug_at > 10.0 {
+            self.bug_busy = false;
+            self.bug_res = Some((false, "No answer from the server, try again".into()));
+        }
         if self.stopped || url.trim().is_empty() {
             self.busy = false;
             return got;
         }
-        if only && known.0.is_empty() && self.auth.is_none() && !self.busy {
+        // logged out: the connection stays open, without logging in, so a login goes out at once
+        let idle = only && known.0.is_empty() && self.auth.is_none() && !self.busy;
+        if idle && self.ready {
             if let Some(s) = self.sock.take() {
                 s.close();
             }
             self.ready = false;
-            return got;
         }
         if let Some(i) = self.invite.as_ref() {
             if now - i.at > INVITE_FOR {
@@ -139,7 +162,8 @@ impl Social {
             }
         }
         let st = self.sock.as_ref().map_or(2, |s| s.state());
-        if st == 2 || (self.ready && now - self.last_rx > DEAD_AFTER) || (st == 0 && now - self.last_rx > 10.0) {
+        // the keepalive gets an answer every second or two, logged in or not: silence means it's dead
+        if st == 2 || (st == 1 && now - self.last_rx > DEAD_AFTER) || (st == 0 && now - self.last_rx > 10.0) {
             // gone: once more in a moment
             let had = self.sock.take().is_some();
             self.ready = false;
@@ -158,7 +182,10 @@ impl Social {
                 self.next_try = now + 2.0;
                 self.last_rx = now;
                 match Socket::connect(url.trim()) {
-                    Ok(s) => self.sock = Some(s),
+                    Ok(mut s) => {
+                        s.keepalive();
+                        self.sock = Some(s);
+                    }
                     Err(e) => {
                         self.err = e.clone();
                         if self.auth.take().is_some() {
@@ -173,7 +200,7 @@ impl Social {
             return got;
         }
         let Some(s) = self.sock.as_ref() else { return got };
-        if st == 1 && !self.ready && self.sent_name.is_empty() {
+        if st == 1 && !self.ready && self.sent_name.is_empty() && !idle {
             // once, right after opening
             self.sent_name = name.to_string();
             let hello = match self.auth.take() {
@@ -232,6 +259,12 @@ impl Social {
                     }
                 }
                 FromServer::Invited { code, name, room } => self.invite = Some(Invite { code, name, room, at: now }),
+                FromServer::Note { note } => self.notes.push(note),
+                FromServer::Latest { build } => self.latest = build,
+                FromServer::BugSaved { ok, msg } => {
+                    self.bug_busy = false;
+                    self.bug_res = Some((ok, msg));
+                }
                 FromServer::FriendStats { with, s } => {
                     self.stats.insert(with, s);
                 }

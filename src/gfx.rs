@@ -632,7 +632,7 @@ impl Gfx {
         let blit_smp = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("blit smp"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
         let encode = if rs.target_format.is_srgb() { 0.0f32 } else { 1.0 };
         let blit_cfg = device.create_buffer(&wgpu::BufferDescriptor { label: Some("blit cfg"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        log::info!("renderer ready: msaa {msaa}, hdr {hdr}, target {:?}", rs.target_format);
+        log::info!("renderer ready: {:?}, msaa {msaa}, hdr {hdr}, target {:?}", rs.adapter.get_info().backend, rs.target_format);
         Gfx { vbuf, ibuf, ranges: mb.ranges, inst_buf, inst_cap, globals_buf, shadow_globals_buf, scene_bg, shadow_bg, shadow_view, p_opaque, p_blend, p_add, p_shadow, p_blit, p_bright, p_down, p_up, bloom_bgl, hdr, color_fmt, encode, blit_bgl, blit_smp, blit_cfg, msaa, targets: None, skin_n: model.indices.len() as u32, skin_v, skin_i, skin_buf, skin_bg, p_skin, p_skin_shadow }
     }
 

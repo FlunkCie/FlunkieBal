@@ -17,6 +17,9 @@ mod sock {
         inbox: Rc<RefCell<VecDeque<(String, f64)>>>,
         state: Rc<RefCell<u8>>, // 0 connecting, 1 open, 2 closed
         _cbs: Vec<Closure<dyn FnMut(JsValue)>>,
+        /// when we last sent anything, for the keepalive
+        sent: Rc<std::cell::Cell<f64>>,
+        timer: Option<(i32, Closure<dyn FnMut()>)>,
     }
     impl Socket {
         pub fn connect(url: &str) -> Result<Socket, String> {
@@ -39,13 +42,33 @@ mod sock {
             ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
             ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
             ws.set_onerror(Some(on_err.as_ref().unchecked_ref()));
-            Ok(Socket { ws, inbox, state, _cbs: vec![on_msg, on_open, on_close, on_err] })
+            Ok(Socket { ws, inbox, state, _cbs: vec![on_msg, on_open, on_close, on_err], sent: Rc::new(std::cell::Cell::new(js_sys::Date::now())), timer: None })
+        }
+        /// Say we're here once a second on a browser timer, whenever the game itself is quiet: a tab in
+        /// the background draws no frames, and a long frame shouldn't look like a dead connection.
+        pub fn keepalive(&mut self) {
+            if self.timer.is_some() {
+                return;
+            }
+            let (ws, st, sent) = (self.ws.clone(), self.state.clone(), self.sent.clone());
+            let cb = Closure::<dyn FnMut()>::new(move || {
+                let now = js_sys::Date::now();
+                if *st.borrow() == 1 && now - sent.get() > super::KEEPALIVE_MS {
+                    sent.set(now);
+                    let _ = ws.send_with_str(super::KEEPALIVE);
+                }
+            });
+            let id = web_sys::window().and_then(|w| w.set_interval_with_callback_and_timeout_and_arguments_0(cb.as_ref().unchecked_ref(), 1000).ok());
+            if let Some(id) = id {
+                self.timer = Some((id, cb));
+            }
         }
         pub fn state(&self) -> u8 {
             *self.state.borrow()
         }
         pub fn send(&self, s: &str) {
             if self.state() == 1 {
+                self.sent.set(js_sys::Date::now());
                 let _ = self.ws.send_with_str(s);
             }
         }
@@ -59,6 +82,9 @@ mod sock {
     }
     impl Drop for Socket {
         fn drop(&mut self) {
+            if let (Some((id, _)), Some(w)) = (self.timer.as_ref(), web_sys::window()) {
+                w.clear_interval_with_handle(*id);
+            }
             // the browser may still fire events after this; they must not reach the dropped closures
             self.ws.set_onmessage(None);
             self.ws.set_onopen(None);
@@ -89,6 +115,7 @@ mod sock {
         inbox: Arc<Mutex<VecDeque<(String, f64)>>>,
         state: Arc<AtomicU8>, // 0 connecting, 1 open, 2 closed
         stop: Arc<AtomicBool>,
+        keep: Arc<AtomicBool>,
     }
     fn now_ms() -> f64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64() * 1000.0)
@@ -96,7 +123,7 @@ mod sock {
     fn gone(e: &tungstenite::Error) -> bool {
         !matches!(e, tungstenite::Error::Io(io) if matches!(io.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut))
     }
-    fn run(url: &str, rx: &mpsc::Receiver<String>, inbox: &Mutex<VecDeque<(String, f64)>>, state: &AtomicU8, stop: &AtomicBool) -> Result<(), String> {
+    fn run(url: &str, rx: &mpsc::Receiver<String>, inbox: &Mutex<VecDeque<(String, f64)>>, state: &AtomicU8, stop: &AtomicBool, keep: &AtomicBool) -> Result<(), String> {
         let uri: tungstenite::http::Uri = url.parse().map_err(|e| format!("{e}"))?;
         let host = uri.host().ok_or("no host in the address")?;
         let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
@@ -109,8 +136,19 @@ mod sock {
         let (mut ws, _) = client_tls_with_config(url, tcp, None, None).map_err(|e| format!("{e}"))?;
         probe.set_read_timeout(Some(POLL)).map_err(|e| format!("{e}"))?;
         state.store(1, Ordering::Relaxed);
+        let mut sent = std::time::Instant::now();
         while !stop.load(Ordering::Relaxed) {
+            // the game is quiet (a long frame, a minimised window): say we're here
+            if keep.load(Ordering::Relaxed) && sent.elapsed().as_secs_f64() * 1000.0 > super::KEEPALIVE_MS {
+                sent = std::time::Instant::now();
+                if let Err(e) = ws.send(Message::Text(super::KEEPALIVE.into())) {
+                    if gone(&e) {
+                        return Err(format!("{e}"));
+                    }
+                }
+            }
             while let Ok(m) = rx.try_recv() {
+                sent = std::time::Instant::now();
                 // a full socket keeps the message queued; `flush` below carries on with it
                 if let Err(e) = ws.send(Message::Text(m.into())) {
                     if gone(&e) {
@@ -125,6 +163,12 @@ mod sock {
             }
             match ws.read() {
                 Ok(Message::Text(t)) => {
+                    // a game in the background draws no frames, so nobody reads the inbox: a phone
+                    // shows its notification from here, at once
+                    #[cfg(target_os = "android")]
+                    if t.starts_with(r#"{"t":"note""#) {
+                        crate::android::note_json(&t);
+                    }
                     // stamped on arrival: a slow frame says nothing about the connection
                     if let Ok(mut q) = inbox.lock() {
                         q.push_back((t.to_string(), now_ms()));
@@ -146,11 +190,12 @@ mod sock {
             let inbox = Arc::new(Mutex::new(VecDeque::new()));
             let state = Arc::new(AtomicU8::new(0));
             let stop = Arc::new(AtomicBool::new(false));
-            let (url, ib, st, sp) = (url.to_string(), inbox.clone(), state.clone(), stop.clone());
+            let keep = Arc::new(AtomicBool::new(false));
+            let (url, ib, st, sp, kp) = (url.to_string(), inbox.clone(), state.clone(), stop.clone(), keep.clone());
             std::thread::Builder::new()
                 .name("flunki-socket".into())
                 .spawn(move || {
-                    if let Err(e) = run(&url, &rx, &ib, &st, &sp) {
+                    if let Err(e) = run(&url, &rx, &ib, &st, &sp, &kp) {
                         if !sp.load(Ordering::Relaxed) {
                             crate::app::log_str(&format!("websocket {url}: {e}"));
                         }
@@ -158,7 +203,11 @@ mod sock {
                     st.store(2, Ordering::Relaxed);
                 })
                 .map_err(|e| format!("{e}"))?;
-            Ok(Socket { out, inbox, state, stop })
+            Ok(Socket { out, inbox, state, stop, keep })
+        }
+        /// Say we're here once a second from the socket's thread whenever the game itself is quiet.
+        pub fn keepalive(&mut self) {
+            self.keep.store(true, Ordering::Relaxed);
         }
         pub fn state(&self) -> u8 {
             self.state.load(Ordering::Relaxed)
@@ -281,6 +330,11 @@ mod sock {
 }
 pub use sock::Socket;
 
+/// What the socket sends by itself when the game has been quiet this long: a heartbeat without a time
+/// (its `Pong` measures nothing) or a snapshot number (nothing to check).
+pub const KEEPALIVE: &str = r#"{"t":"hb","c":0,"r":0,"s":0,"d":0}"#;
+pub const KEEPALIVE_MS: f64 = 1500.0;
+
 /// Nothing at all from the server for this long while connected: the connection is dead, whatever the socket says.
 pub const DEAD_AFTER: f64 = 5.0;
 /// Trying to reconnect this long; after that the seat is given up.
@@ -333,8 +387,21 @@ pub struct Net {
 impl Net {
     pub fn connect(url: &str, now: f64) -> Result<Net, String> {
         let url = url.trim();
-        let sock = Socket::connect(url)?;
+        let mut sock = Socket::connect(url)?;
+        sock.keepalive();
         Ok(Net { sock, url: url.into(), id: 0, code: String::new(), token: String::new(), in_room: false, host_id: 0, phase: PHASE_LOBBY, rooms: Vec::new(), members: Vec::new(), arena: "vondel".into(), diff: 1, open: false, ping_t: -10.0, pending: Vec::new(), rtt: 0.0, last_rx: now, opened: now, reconnect: None, status: Vec::new() })
+    }
+    /// Out of the room; the connection stays for the next one.
+    pub fn leave_room(&mut self) {
+        self.in_room = false;
+        self.code.clear();
+        self.token.clear();
+        self.id = 0;
+        self.host_id = 0;
+        self.members.clear();
+        self.status.clear();
+        self.phase = PHASE_LOBBY;
+        self.open = false;
     }
     pub fn host(&self) -> bool {
         self.in_room && self.host_id == self.id

@@ -19,6 +19,11 @@ const ACTIONS_PER_MIN: u32 = 60;
 const NEW_ACCOUNTS_PER_MIN: u32 = 60;
 const SAVE_AFTER: f32 = 3.0;
 const PAIR_RECENT: usize = 20;
+/// Notifications kept per account, and for how long: a phone checks every quarter of an hour or so.
+const NOTES_KEEP: usize = 30;
+const NOTE_AGE: u64 = 24 * 3600;
+/// The part of a message a notification shows.
+const NOTE_TEXT: usize = 120;
 
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -38,6 +43,11 @@ struct Account {
     sent: Vec<String>,
     /// friend → the last message id I've seen
     read: HashMap<String, u64>,
+    /// what to tell them about while they're not looking (invites, messages), and the last note's id
+    notes: Vec<Note>,
+    note_next: u64,
+    /// invites up to this note have reached the game itself (the phone's check still gets them)
+    invites_seen: u64,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -168,6 +178,10 @@ impl Social {
     }
     pub fn conn_of(&self, code: &str) -> Option<u64> {
         self.online.get(code).map(|o| o.conn)
+    }
+    /// The friend code logged in on this connection.
+    pub fn account_of(&self, conn: u64) -> Option<String> {
+        self.by_conn.get(&conn).cloned()
     }
     pub fn is_online_conn(&self, conn: u64) -> bool {
         self.by_conn.contains_key(&conn)
@@ -402,8 +416,11 @@ impl Social {
                 }
                 self.dirty();
                 out.push((me.clone(), FromServer::Said { with: to.clone(), m: msg.clone() }));
+                let name = self.store.accounts.get(&me).map_or(String::new(), |a| a.name.clone());
+                let short: String = msg.text.chars().take(NOTE_TEXT).collect();
                 out.push((to.clone(), FromServer::Said { with: me.clone(), m: msg }));
                 out.push((to.clone(), self.list(&to)));
+                self.note(&to, NOTE_MSG, &me, &name, &short, "", &mut out);
             }
             ToServer::ChatOpen { with } => {
                 let with = clean_code(&with);
@@ -432,16 +449,60 @@ impl Social {
                 if !can_invite {
                     return Err("That match can't take more people".into());
                 }
-                if !self.online.contains_key(&to) {
-                    return Err("They're offline".into());
-                }
                 let name = self.store.accounts.get(&me).map_or(String::new(), |a| a.name.clone());
-                debug!("friends: {me} invites {to} to room {room}");
-                out.push((to, FromServer::Invited { code: me, name, room }));
+                debug!("friends: {me} invites {to} to room {room}{}", if self.online.contains_key(&to) { "" } else { " (offline: a notification)" });
+                // online the game asks at once; either way it's a notification, for a phone in a pocket
+                if self.online.contains_key(&to) {
+                    out.push((to.clone(), FromServer::Invited { code: me.clone(), name: name.clone(), room: room.clone() }));
+                }
+                self.note(&to, NOTE_INVITE, &me, &name, "", &room, &mut out);
             }
             _ => {}
         }
         Ok(out)
+    }
+    /// Something to tell `to` about: kept for their phone's background check, and sent at once if
+    /// they're connected (a game in the background shows it). A new invite from someone replaces their last.
+    fn note(&mut self, to: &str, kind: u8, from: &str, name: &str, text: &str, room: &str, out: &mut Out) {
+        let Some(a) = self.store.accounts.get_mut(to) else { return };
+        let t = now();
+        a.note_next += 1;
+        let note = Note { id: a.note_next, kind, from: from.into(), name: name.into(), text: text.into(), room: room.into(), at: t };
+        a.notes.retain(|n| t.saturating_sub(n.at) < NOTE_AGE && !(kind == NOTE_INVITE && n.kind == NOTE_INVITE && n.from == from));
+        a.notes.push(note.clone());
+        if a.notes.len() > NOTES_KEEP {
+            let extra = a.notes.len() - NOTES_KEEP;
+            a.notes.drain(..extra);
+        }
+        let online = self.online.contains_key(to);
+        if online && kind == NOTE_INVITE {
+            a.invites_seen = a.note_next;
+        }
+        self.dirty();
+        if online {
+            out.push((to.into(), FromServer::Note { note }));
+        }
+    }
+    /// The notes for a phone's background check: newer than `after`, still current. None: not who they say.
+    /// `room_ok` says whether an invite's room can still be joined.
+    pub fn notes_for(&self, code: &str, secret: &str, after: u64, room_ok: impl Fn(&str) -> bool) -> Option<Vec<Note>> {
+        if !self.known(code, secret) {
+            return None;
+        }
+        let t = now();
+        let a = &self.store.accounts[code];
+        Some(a.notes.iter().filter(|n| n.id > after && t.saturating_sub(n.at) < if n.kind == NOTE_INVITE { INVITE_KEEP } else { NOTE_AGE }).filter(|n| n.kind != NOTE_INVITE || room_ok(&n.room)).cloned().collect())
+    }
+    /// Invites that came while they were away and are still good, each handed over once: (from, name, room).
+    pub fn waiting_invites(&mut self, conn: u64) -> Vec<(String, String, String)> {
+        let Some(a) = self.by_conn.get(&conn).and_then(|c| self.store.accounts.get_mut(c)) else { return Vec::new() };
+        let t = now();
+        let got = a.notes.iter().filter(|n| n.kind == NOTE_INVITE && n.id > a.invites_seen && t.saturating_sub(n.at) < INVITE_KEEP).map(|n| (n.from.clone(), n.name.clone(), n.room.clone())).collect();
+        if a.invites_seen != a.note_next {
+            a.invites_seen = a.note_next;
+            self.changed.get_or_insert_with(Instant::now);
+        }
+        got
     }
     /// Is this who they say they are? Then their matches count.
     pub fn verified(&self, me: &(String, String)) -> Option<String> {

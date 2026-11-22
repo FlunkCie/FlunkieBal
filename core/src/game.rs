@@ -85,7 +85,7 @@ impl Foul {
             Foul::Stop => "Drank after STOP",
             Foul::False => "False start",
             Foul::Auto => "Autoclicker",
-            Foul::Can => "Bottle knocked over",
+            Foul::Can => "Beer knocked over",
         }
     }
 }
@@ -232,11 +232,13 @@ pub struct Team {
     pub straf: u32,
     pub drinking: bool,
     pub late_ok: bool,
-    pub early: f32,
+    /// steps tapped before the hit, a head start for each player who runs
+    pub early: [f32; 3],
     false_straf_for: i64,
     unseen_for: i64,
-    pub dc: DrinkCtl,
-    pub rc: RunCtl,
+    /// each player's own DRINK button and run pads: online every person works their own players
+    pub dc: [DrinkCtl; 3],
+    pub rc: [RunCtl; 3],
 }
 impl Team {
     fn new(name: &'static str, side: f32, color: [f32; 3]) -> Self {
@@ -257,11 +259,11 @@ impl Team {
             straf: 0,
             drinking: false,
             late_ok: false,
-            early: 0.0,
+            early: [0.0; 3],
             false_straf_for: -1,
             unseen_for: -1,
-            dc: DrinkCtl::default(),
-            rc: RunCtl::default(),
+            dc: Default::default(),
+            rc: Default::default(),
         }
     }
     pub fn face(&self) -> f32 {
@@ -294,7 +296,15 @@ impl Team {
         let hm = self.homes[i];
         [hm.x - 0.07 + k as f32 * 0.085, hm.z - self.side * 0.42]
     }
+    /// The player whose button `who`'s screen shows: the first of theirs still drinking.
+    pub fn lead(&self, who: Who) -> Option<usize> {
+        (0..3).find(|&i| who[i] && self.beers[i] > 0.0).or_else(|| (0..3).find(|&i| who[i]))
+    }
 }
+
+/// Which of a team's three players one person works (the buttons on their screen).
+pub type Who = [bool; 3];
+pub const ALL: Who = [true; 3];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -332,7 +342,9 @@ pub struct RunState {
     pub runners: usize,
     pub ri: usize,
     pub phase: Phase,
+    /// how hard each runner is being tapped on: the first, and the second
     pub boost: f32,
+    pub boost2: f32,
     pub mult: f32,
     t: f32,
     pt: f32,
@@ -583,6 +595,8 @@ pub struct Game {
     flight_t: f32,
     flight_no: i64,
     ln_i: i64,
+    /// who threw the ball in the air (team, player): `idx` has already moved on to the next thrower
+    pub thrown_by: Option<(usize, usize)>,
     throw_ring: u8,
     throw_curve: f32,
     timers: Vec<(f32, u64, Act)>,
@@ -619,8 +633,11 @@ pub struct Game {
     pub net_pause: Option<(u32, f32)>,
     pub net_aim_left: f32,
     pub ball_target: Option<(Vec3, Vec3)>,
-    pub net_sneak: [f32; 2],
+    /// each player's sneaky sip, how far along (below 0: none)
+    pub net_sneak: [f32; 6],
     pub net_run: bool,
+    /// online: who runs (first and second runner; below 0: nobody)
+    pub net_ri: [i8; 2],
     pub net_status: String,
 }
 
@@ -671,6 +688,7 @@ impl Game {
             flight_t: 0.0,
             flight_no: 0,
             ln_i: 0,
+            thrown_by: None,
             throw_ring: 0,
             throw_curve: 0.0,
             timers: Vec::new(),
@@ -700,8 +718,9 @@ impl Game {
             net_pause: None,
             net_aim_left: -1.0,
             ball_target: None,
-            net_sneak: [-1.0; 2],
+            net_sneak: [-1.0; 6],
             net_run: false,
+            net_ri: [-1; 2],
             net_status: String::new(),
         };
         g.referee.anim.mode = AMode::Sit;
@@ -914,9 +933,9 @@ impl Game {
             t.straf = 0;
             t.drinking = false;
             t.late_ok = false;
-            t.early = 0.0;
-            t.dc = DrinkCtl::default();
-            t.rc = RunCtl::default();
+            t.early = [0.0; 3];
+            t.dc = Default::default();
+            t.rc = Default::default();
             t.mult = mult;
             for i in 0..3 {
                 let p = &mut t.players[i];
@@ -941,6 +960,7 @@ impl Game {
         self.my_sneak_t = -1.0;
         self.ball_free = false;
         self.holder = None;
+        self.thrown_by = None;
         self.trail.clear();
     }
 
@@ -965,7 +985,9 @@ impl Game {
     pub fn sides_changed(&mut self) {
         for t in 0..2 {
             if self.ctrl(t) == Ctrl::Cpu {
-                self.teams[t].dc.hold = false;
+                for d in self.teams[t].dc.iter_mut() {
+                    d.hold = false;
+                }
             }
         }
         if self.state == State::Aim && self.ctrl(self.turn) == Ctrl::Cpu {
@@ -1078,10 +1100,11 @@ impl Game {
         self.hitter = None;
         for x in self.teams.iter_mut() {
             x.late_ok = false;
-            x.early = 0.0;
+            x.early = [0.0; 3];
         }
         self.knocked.clear();
         self.trail.clear();
+        self.thrown_by = None;
         let idx = self.teams[t].active_idx(self.teams[t].idx);
         self.teams[t].idx = idx;
         let th = &mut self.teams[t].players[idx];
@@ -1135,6 +1158,7 @@ impl Game {
         let ti = self.teams[t].idx;
         self.teams[t].idx = (ti + 1) % 3;
         self.teams[t].throws += 1;
+        self.thrown_by = Some((t, ti));
         self.ball = o.origin;
         let a = 0.5f32;
         let d = o.dist.max(1.2);
@@ -1148,8 +1172,8 @@ impl Game {
         if a.throw_t < 0.0 || a.throw_t > crate::anim::THROW_RELEASE {
             a.throw_t = crate::anim::THROW_RELEASE;
         }
-        self.teams[0].early = 0.0;
-        self.teams[1].early = 0.0;
+        self.teams[0].early = [0.0; 3];
+        self.teams[1].early = [0.0; 3];
         self.trail.clear();
         let opp = 1 - t;
         self.stat(StatEv::Throw { team: t, idx: ti });
@@ -1284,6 +1308,7 @@ impl Game {
                                 self.splash_at(vec3(cp[0], 0.12, cp[1]), 14);
                                 self.ball = p;
                                 self.ball_vel = v;
+                                // the Strafbier is for the beer's owner: knock over theirs and they drink one more
                                 self.judge(ti, Foul::Can);
                                 return "can";
                             }
@@ -1390,7 +1415,7 @@ impl Game {
         }
         if self.train.is_some() {
             let o = 1 - self.turn;
-            self.teams[o].early = 0.0;
+            self.teams[o].early = [0.0; 3];
         }
         let hit = self.turn;
         let runners = 1 - hit;
@@ -1437,7 +1462,8 @@ impl Game {
             runners,
             ri,
             phase: Phase::Ball,
-            boost: self.teams[runners].early * 0.6,
+            boost: self.teams[runners].early[ri] * 0.6,
+            boost2: ri2.map_or(0.0, |i| self.teams[runners].early[i] * 0.6),
             mult,
             t: 0.0,
             pt: 0.0,
@@ -1452,7 +1478,7 @@ impl Game {
             bx2,
             bz2,
         });
-        self.teams[runners].early = 0.0;
+        self.teams[runners].early = [0.0; 3];
         self.ref_until = 0.0;
         self.hitter = Some(hit);
         self.teams[hit].drinking = true;
@@ -1494,8 +1520,12 @@ impl Game {
         let d = DIFFS[self.diff];
         let Some(mut r) = self.run.take() else { return };
         r.boost *= (-2.2 * dt).exp();
+        r.boost2 *= (-2.2 * dt).exp();
         r.t += dt;
-        let speed = if self.ctrl(r.runners) == Ctrl::Cpu { d.run * (0.95 + 0.1 * (r.t * 3.0).sin()) + r.boost * 0.5 } else { 1.4 + r.boost };
+        // each runner goes as fast as their own person taps
+        let cpu = self.ctrl(r.runners) == Ctrl::Cpu;
+        let pace = |b: f32| if cpu { d.run * (0.95 + 0.1 * (r.t * 3.0).sin()) + b * 0.5 } else { 1.4 + b };
+        let (speed, speed2) = (pace(r.boost), pace(r.boost2));
         let mut step = false;
         let tip = self.tip_dir;
         // first runner: the ball
@@ -1570,7 +1600,7 @@ impl Game {
             match r.phase2 {
                 Phase::Bottle => {
                     let q = &mut self.teams[r.runners].players[i2];
-                    if Self::move_toward(q, r.bx2, r.bz2, speed, dt, &mut step) < 0.03 {
+                    if Self::move_toward(q, r.bx2, r.bz2, speed2, dt, &mut step) < 0.03 {
                         r.phase2 = Phase::Fix;
                         r.ft2 = 0.0;
                         r.th2 = self.theta;
@@ -1597,7 +1627,7 @@ impl Game {
                 Phase::Home => {
                     let h = self.teams[r.runners].homes[i2];
                     let q = &mut self.teams[r.runners].players[i2];
-                    if Self::move_toward(q, h.x, h.z, speed, dt, &mut step) < 0.02 {
+                    if Self::move_toward(q, h.x, h.z, speed2, dt, &mut step) < 0.02 {
                         r.phase2 = Phase::Done;
                         Self::still(q, AMode::Idle);
                         q.yaw = (-q.pos.x).atan2(-q.pos.z);
@@ -1663,12 +1693,13 @@ impl Game {
         format!("{who}: {what}")
     }
 
-    fn drink(&mut self, t: usize, amt: f32, _idxs: Option<&[usize]>) {
+    /// Team `t` drinks: one player (`Some(i)`, someone holding their own DRINK) or all of them (the computer).
+    fn drink(&mut self, t: usize, amt: f32, only: Option<usize>) {
         if self.hitter != Some(t) || !(self.state == State::Run || (self.state == State::Stopped && self.teams[t].late_ok)) {
             return;
         }
         let tm = &mut self.teams[t];
-        for i in 0..3 {
+        for i in (0..3).filter(|i| only.map_or(true, |o| o == *i)) {
             tm.beers[i] = (tm.beers[i] - amt * tm.mult[i]).max(0.0);
         }
         if tm.beers.iter().all(|b| *b <= 0.0) {
@@ -1794,10 +1825,17 @@ impl Game {
                 self.splash_at(hp, 18);
             }
             Foul::Stop => {
-                self.teams[t].dc.hold = false;
-                self.teams[t].dc.late = false;
+                for d in self.teams[t].dc.iter_mut() {
+                    d.hold = false;
+                    d.late = false;
+                }
             }
-            Foul::False => self.teams[t].rc.caught_for = self.flight_no,
+            Foul::False => {
+                let f = self.flight_no;
+                for r in self.teams[t].rc.iter_mut() {
+                    r.caught_for = f;
+                }
+            }
             Foul::Sneak => {
                 if self.ctrl(t) == Ctrl::Local {
                     self.my_sneak_t = -1.0;
@@ -2041,7 +2079,7 @@ impl Game {
             }
             tr.pen += 2.0;
             if code == Foul::False {
-                self.teams[0].early = 0.0;
+                self.teams[0].early = [0.0; 3];
             }
             self.banners.push(Banner { title: "+2 seconds".into(), sub: code.text().into(), dur: 1.3, straf: true });
             self.sfx(Sfx::Straf);
@@ -2053,7 +2091,7 @@ impl Game {
         if code == Foul::Can || self.ref_sees(t) {
             if code == Foul::False {
                 self.teams[t].false_straf_for = self.ln_i;
-                self.teams[t].early = 0.0;
+                self.teams[t].early = [0.0; 3];
             }
             if code == Foul::Stop {
                 self.teams[t].late_ok = false;
@@ -2076,29 +2114,41 @@ impl Game {
     }
 
     // ---------- local controls ----------
-    pub fn drink_press(&mut self, t: usize) {
+    /// `who` (one person's players on team `t`) press DRINK. Only players who still have beer drink.
+    pub fn drink_press(&mut self, t: usize, who: Who) {
+        let Some(k) = self.teams[t].lead(who) else { return };
         let can = self.can_drink(t);
-        if !can && self.teams[t].dc.stop_show <= 0.0 {
+        if !can && !(0..3).any(|i| who[i] && self.teams[t].dc[i].stop_show > 0.0) {
             return;
         }
-        if self.bot_tap(t) {
+        if self.bot_tap(t, k) {
             self.judge(t, Foul::Auto);
             return;
         }
-        if self.teams[t].dc.cough > 0.0 || !can {
+        if !can {
             return;
         }
+        // one pace for all of one person's players, so their gauges go as one
         let m = 0.8 + self.rng.f() * 0.45;
-        let d = &mut self.teams[t].dc;
-        d.hold = true;
-        d.mul = m;
+        let tm = &mut self.teams[t];
+        for i in 0..3 {
+            if who[i] && tm.beers[i] > 0.0 && tm.dc[i].cough <= 0.0 {
+                tm.dc[i].hold = true;
+                tm.dc[i].mul = m;
+            }
+        }
     }
-    pub fn drink_release(&mut self, t: usize) {
-        self.teams[t].dc.hold = false;
+    pub fn drink_release(&mut self, t: usize, who: Who) {
+        for i in 0..3 {
+            if who[i] {
+                self.teams[t].dc[i].hold = false;
+            }
+        }
     }
-    fn bot_tap(&mut self, t: usize) -> bool {
+    /// Taps too fast or too even for a thumb. Kept per person (their first player's pads).
+    fn bot_tap(&mut self, t: usize, k: usize) -> bool {
         let ts = self.tap_ms.unwrap_or(self.clock as f64 * 1000.0);
-        let a = &mut self.teams[t].rc.times;
+        let a = &mut self.teams[t].rc[k].times;
         a.push(ts);
         if a.len() > 16 {
             a.remove(0);
@@ -2122,106 +2172,162 @@ impl Game {
         }
         bot
     }
-    pub fn pad_press(&mut self, t: usize, foot: Foot) {
-        self.teams[t].rc.down[foot as usize] = 0.08;
-        if self.teams[t].rc.lock > 0.0 {
+    /// Who runs: the team, the first runner and the second, if anyone.
+    pub fn runners(&self) -> Option<(usize, usize, Option<usize>)> {
+        if self.mirror {
+            let h = self.hitter.filter(|_| self.state == State::Run && self.net_ri[0] >= 0)?;
+            return Some((1 - h, self.net_ri[0] as usize % 3, (self.net_ri[1] >= 0).then(|| self.net_ri[1] as usize % 3)));
+        }
+        self.run.as_ref().filter(|_| self.state == State::Run).map(|r| (r.runners, r.ri, r.ri2))
+    }
+    /// Which of `who` run right now (first runner, second runner).
+    pub fn running_of(&self, t: usize, who: Who) -> (bool, bool) {
+        match self.runners().filter(|r| r.0 == t) {
+            Some((_, a, b)) => (who[a], b.map_or(false, |i| who[i])),
+            None => (false, false),
+        }
+    }
+    /// Whether one of `who` runs when the other team hits: the next two of the team to throw.
+    pub fn will_run(&self, t: usize, who: Who) -> bool {
+        let tm = &self.teams[t];
+        who[tm.runner_idx()] || tm.runner2_idx().map_or(false, |i| who[i])
+    }
+    /// `who` (one person's players on team `t`) tap a pad: only their own runners speed up.
+    pub fn pad_press(&mut self, t: usize, who: Who, foot: Foot) {
+        let Some(k) = self.teams[t].lead(who) else { return };
+        let mine = |g: &mut Game, f: &mut dyn FnMut(&mut RunCtl)| {
+            for i in 0..3 {
+                if who[i] {
+                    f(&mut g.teams[t].rc[i]);
+                }
+            }
+        };
+        mine(self, &mut |r| r.down[foot as usize] = 0.08);
+        if self.teams[t].rc[k].lock > 0.0 {
             return;
         }
-        if self.bot_tap(t) {
-            self.teams[t].rc.lock = 2.5;
+        if self.bot_tap(t, k) {
+            mine(self, &mut |r| r.lock = 2.5);
             self.judge(t, Foul::Auto);
             return;
         }
         if self.false_start_window(t) {
-            if self.teams[t].rc.last != Some(foot) {
-                self.teams[t].early = (self.teams[t].early + 1.0).min(6.0);
+            for i in 0..3 {
+                if who[i] && self.teams[t].rc[i].last != Some(foot) {
+                    self.teams[t].early[i] = (self.teams[t].early[i] + 1.0).min(6.0);
+                }
             }
-            self.teams[t].rc.last = Some(foot);
-            let rc = &self.teams[t].rc;
+            mine(self, &mut |r| r.last = Some(foot));
+            let rc = &self.teams[t].rc[k];
             if rc.caught_for != self.flight_no && (rc.false_for != self.flight_no || self.game_time - rc.false_t > 0.8) {
-                let fno = self.flight_no;
-                let gt = self.game_time;
-                self.teams[t].rc.false_for = fno;
-                self.teams[t].rc.false_t = gt;
+                let (fno, gt) = (self.flight_no, self.game_time);
+                mine(self, &mut |r| {
+                    r.false_for = fno;
+                    r.false_t = gt;
+                });
                 self.judge(t, Foul::False);
             }
             return;
         }
-        if !self.can_run(t) {
+        let (r1, r2) = self.running_of(t, who);
+        if !self.can_run(t) || !(r1 || r2) {
             return;
         }
-        if self.teams[t].rc.last == Some(foot) {
+        if self.teams[t].rc[k].last == Some(foot) {
             if let Some(r) = self.run.as_mut() {
-                r.boost *= 0.45;
+                if r1 {
+                    r.boost *= 0.45;
+                }
+                if r2 {
+                    r.boost2 *= 0.45;
+                }
             }
-            self.teams[t].rc.msg = "Stumble! Alternate L and R".into();
-            self.teams[t].rc.msg_t = 0.9;
+            mine(self, &mut |r| {
+                r.msg = "Stumble! Alternate L and R".into();
+                r.msg_t = 0.9;
+            });
         } else {
             if let Some(r) = self.run.as_mut() {
-                if r.runners == t {
+                if r1 {
                     r.boost = (r.boost + 0.75).min(5.5);
+                }
+                if r2 {
+                    r.boost2 = (r.boost2 + 0.75).min(5.5);
                 }
             }
             self.sfx(Sfx::Step);
         }
-        self.teams[t].rc.last = Some(foot);
+        mine(self, &mut |r| r.last = Some(foot));
     }
 
     fn update_drink_ctl(&mut self, t: usize, dt: f32) {
         let can = self.can_drink(t);
-        let mut consume = 0.0;
+        let m = self.run.as_ref().map_or(1.0, |r| r.mult);
+        // one person's players choke or keep drinking after STOP together: that's one foul, not three
         let mut spill = false;
         let mut glug = false;
         let mut stop = false;
-        {
-            let d = &mut self.teams[t].dc;
-            if d.cough > 0.0 {
-                d.cough -= dt;
-                d.p = (d.p - dt * 0.5).max(0.0);
-            }
-            let late = d.late && d.stop_show > 0.0;
-            if (can || late) && d.hold && d.cough <= 0.0 {
-                d.ht += dt;
-                consume = 0.09 * (0.5 + d.ht.min(2.5) * 0.6) * dt;
-                d.p += dt * (0.35 + d.ht * 0.28) * d.mul;
-                d.glug += dt;
-                if d.glug > 0.32 {
-                    d.glug = 0.0;
-                    glug = true;
+        for i in 0..3 {
+            let mut consume = 0.0;
+            {
+                let d = &mut self.teams[t].dc[i];
+                if d.cough > 0.0 {
+                    d.cough -= dt;
+                    d.p = (d.p - dt * 0.5).max(0.0);
                 }
-                if d.p >= 1.0 {
-                    d.p = 1.0;
-                    d.cough = 1.4;
-                    d.hold = false;
-                    d.ht = 0.0;
-                    spill = true;
-                }
-            } else {
-                if !d.hold {
-                    d.ht = 0.0;
-                }
-                d.p = (d.p - dt * 0.9).max(0.0);
-            }
-            if d.stop_watch > 0.0 {
-                if !d.hold {
-                    d.stop_watch = 0.0;
+                let late = d.late && d.stop_show > 0.0;
+                if (can || late) && d.hold && d.cough <= 0.0 {
+                    d.ht += dt;
+                    consume = 0.09 * (0.5 + d.ht.min(2.5) * 0.6) * dt;
+                    d.p += dt * (0.35 + d.ht * 0.28) * d.mul;
+                    d.glug += dt;
+                    if d.glug > 0.32 {
+                        d.glug = 0.0;
+                        glug = true;
+                    }
+                    if d.p >= 1.0 {
+                        d.p = 1.0;
+                        d.cough = 1.4;
+                        d.hold = false;
+                        d.ht = 0.0;
+                        spill = true;
+                    }
                 } else {
-                    d.stop_watch -= dt;
-                    if d.stop_watch <= 0.0 {
-                        d.late = true;
-                        stop = true;
+                    if !d.hold {
+                        d.ht = 0.0;
+                    }
+                    d.p = (d.p - dt * 0.9).max(0.0);
+                }
+                if d.stop_watch > 0.0 {
+                    if !d.hold {
+                        d.stop_watch = 0.0;
+                    } else {
+                        d.stop_watch -= dt;
+                        if d.stop_watch <= 0.0 {
+                            d.late = true;
+                            stop = true;
+                        }
                     }
                 }
+                if d.stop_show > 0.0 {
+                    d.stop_show -= dt;
+                } else {
+                    d.late = false;
+                }
             }
-            if d.stop_show > 0.0 {
-                d.stop_show -= dt;
-            } else {
-                d.late = false;
+            if consume > 0.0 {
+                self.drink(t, consume * m, Some(i));
             }
-        }
-        if consume > 0.0 {
-            let m = self.run.as_ref().map_or(1.0, |r| r.mult);
-            self.drink(t, consume * m, None);
+            let rc = &mut self.teams[t].rc[i];
+            if rc.lock > 0.0 {
+                rc.lock -= dt;
+            }
+            if rc.msg_t > 0.0 {
+                rc.msg_t -= dt;
+            }
+            for d in rc.down.iter_mut() {
+                *d -= dt;
+            }
         }
         if glug {
             self.sfx(Sfx::Glug);
@@ -2233,16 +2339,6 @@ impl Game {
         if stop {
             self.judge(t, Foul::Stop);
         }
-        let rc = &mut self.teams[t].rc;
-        if rc.lock > 0.0 {
-            rc.lock -= dt;
-        }
-        if rc.msg_t > 0.0 {
-            rc.msg_t -= dt;
-        }
-        for d in rc.down.iter_mut() {
-            *d -= dt;
-        }
     }
 
     fn watch_stop(&mut self) {
@@ -2253,10 +2349,11 @@ impl Game {
             if let Some(lh) = self.last_hitter {
                 if self.ctrl(lh) == Ctrl::Local {
                     let grace = self.stop_grace[lh];
-                    let d = &mut self.teams[lh].dc;
-                    d.stop_show = 1.1;
-                    if d.hold {
-                        d.stop_watch = 0.35 + grace;
+                    for d in self.teams[lh].dc.iter_mut() {
+                        d.stop_show = 1.1;
+                        if d.hold {
+                            d.stop_watch = 0.35 + grace;
+                        }
                     }
                 }
             }
@@ -2264,55 +2361,62 @@ impl Game {
         if self.prev_state != State::Flight && self.state == State::Flight {
             self.flight_no += 1;
             for t in self.teams.iter_mut() {
-                t.rc.last = None;
+                for r in t.rc.iter_mut() {
+                    r.last = None;
+                }
             }
         }
         self.prev_state = self.state;
     }
 
     // ---------- sneaky sips ----------
-    fn sneak_idxs(&self, t: usize) -> Vec<usize> {
+    fn sneak_idxs(&self, t: usize, who: Who) -> Vec<usize> {
         (0..3)
-            .filter(|&i| self.teams[t].beers[i] > SNEAK_LEFT && !(self.state == State::Run && self.run.as_ref().map_or(false, |r| r.runners == t && (r.ri == i || r.ri2 == Some(i)))))
+            .filter(|&i| who[i] && self.teams[t].beers[i] > SNEAK_LEFT && !self.sneak_vis(t, i) && !(self.state == State::Run && self.run.as_ref().map_or(false, |r| r.runners == t && (r.ri == i || r.ri2 == Some(i)))))
             .collect()
     }
     fn sneak_ok(&self, t: usize, idxs: &[usize]) -> bool {
         matches!(self.state, State::Aim | State::CpuAim | State::Flight | State::Stopped | State::Run) && !self.can_drink(t) && !idxs.is_empty()
     }
+    /// Whether this screen may start a sneaky sip now.
     pub fn sneak_allowed(&self) -> bool {
         match self.my_team {
-            Some(t) => self.sneak_allowed_for(t) && self.sneak_progress_team(t).is_none(),
+            Some(t) => self.sneak_allowed_for(t, self.my_players[t]) && self.sneak_progress().is_none(),
             None => false,
         }
     }
-    pub fn sneak_allowed_for(&self, t: usize) -> bool {
+    pub fn sneak_allowed_for(&self, t: usize, who: Who) -> bool {
         let people = match self.mode {
             Mode::Cpu => t == 0,
             Mode::Online => self.humans[t] > 0,
             _ => false,
         };
         if self.mirror {
-            return people && matches!(self.state, State::Aim | State::CpuAim | State::Flight | State::Stopped | State::Run) && !self.can_drink(t);
+            let some = (0..3).any(|i| who[i] && self.teams[t].beers[i] > SNEAK_LEFT && self.net_sneak[t * 3 + i] < 0.0);
+            return people && some && matches!(self.state, State::Aim | State::CpuAim | State::Flight | State::Stopped | State::Run) && !self.can_drink(t);
         }
-        people && !self.practice() && self.sneak_ok(t, &self.sneak_idxs(t))
+        people && !self.practice() && self.sneak_ok(t, &self.sneak_idxs(t, who))
     }
-    /// How far along a sneaky sip by people on team `t` is.
-    pub fn sneak_progress_team(&self, t: usize) -> Option<f32> {
+    /// How far along player `i`'s sneaky sip is, if they're having one.
+    pub fn sneak_progress_of(&self, t: usize, i: usize) -> Option<f32> {
         if self.mirror {
-            return (self.net_sneak[t] >= 0.0).then_some(self.net_sneak[t]);
+            let v = self.net_sneak[t * 3 + i];
+            return (v >= 0.0).then_some(v);
         }
-        self.sneaks.iter().find(|s| s.t == t && s.human).map(|s| ((self.game_time - s.start) / SNEAK_DUR).min(1.0))
+        self.sneaks.iter().find(|s| s.t == t && s.human && s.idxs.contains(&i)).map(|s| ((self.game_time - s.start) / SNEAK_DUR).min(1.0))
     }
     pub fn start_sneak(&mut self) {
         if let Some(t) = self.my_team {
-            self.start_sneak_for(t);
+            self.start_sneak_for(t, self.my_players[t]);
         }
     }
-    pub fn start_sneak_for(&mut self, t: usize) {
-        if self.sneak_progress_team(t).is_some() || !self.sneak_allowed_for(t) || self.mirror {
+    /// `who` (one person's players on team `t`) sneak a sip.
+    pub fn start_sneak_for(&mut self, t: usize, who: Who) {
+        if !self.sneak_allowed_for(t, who) || self.mirror {
             return;
         }
-        if self.my_team == Some(t) {
+        let mine = self.my_team == Some(t) && (0..3).any(|i| who[i] && self.my_players[t][i]);
+        if mine {
             self.my_sneak_t = self.game_time;
         }
         self.sfx(Sfx::Glug);
@@ -2321,14 +2425,16 @@ impl Game {
             self.judge(t, Foul::Sneak);
             return;
         }
-        let idxs = self.sneak_idxs(t);
-        self.sneaks.push(Sneak { t, idxs, start: self.game_time, mine: self.my_team == Some(t), human: true });
+        let idxs = self.sneak_idxs(t, who);
+        self.sneaks.push(Sneak { t, idxs, start: self.game_time, mine, human: true });
     }
     pub fn sneak_vis(&self, t: usize, i: usize) -> bool {
         self.sneaks.iter().any(|s| s.t == t && s.idxs.contains(&i))
     }
+    /// This screen's own sneaky sip.
     pub fn sneak_progress(&self) -> Option<f32> {
-        self.my_team.and_then(|t| self.sneak_progress_team(t))
+        let t = self.my_team?;
+        (0..3).filter(|&i| self.my_players[t][i]).find_map(|i| self.sneak_progress_of(t, i))
     }
     fn sneak_tick(&mut self, dt: f32) {
         let mut i = 0;
@@ -2375,7 +2481,7 @@ impl Game {
                 }
                 let rate = 0.045 * [0.6, 1.0, 1.7][self.diff] * if self.referee.anim.smoking { 2.5 } else { 1.0 };
                 if self.rng.f() < dt * rate {
-                    let ix = self.sneak_idxs(t);
+                    let ix = self.sneak_idxs(t, ALL);
                     if self.sneak_ok(t, &ix) {
                         self.sneaks.push(Sneak { t, idxs: ix, start: self.game_time, mine: false, human: false });
                     }
@@ -2412,7 +2518,7 @@ impl Game {
                 Act::ShowOver(_) => self.show_over = true,
                 Act::CpuFalse(t) => {
                     if self.state == State::Flight {
-                        self.teams[t].early = 4.0;
+                        self.teams[t].early = [4.0; 3];
                         self.judge(t, Foul::False);
                     }
                 }
@@ -2547,7 +2653,7 @@ impl Game {
             for i in 0..3 {
                 let mut s = false;
                 if self.teams[ti].drinking {
-                    s = if c == Ctrl::Local { self.teams[ti].dc.hold && self.teams[ti].dc.cough <= 0.0 } else { (self.clock * 2.2 + i as f32 * 0.8).sin() > -0.45 };
+                    s = if c == Ctrl::Local { self.teams[ti].dc[i].hold && self.teams[ti].dc[i].cough <= 0.0 } else { (self.clock * 2.2 + i as f32 * 0.8).sin() > -0.45 };
                 }
                 let running = self.run.as_ref().map_or(false, |r| r.runners == ti && (r.ri == i || r.ri2 == Some(i)));
                 let sv = self.sneak_vis(ti, i);
@@ -2669,10 +2775,10 @@ mod tests {
                 break;
             }
             if i % 5 == 0 {
-                g.drink_press(0)
+                g.drink_press(0, ALL)
             }
             if i % 5 == 3 {
-                g.drink_release(0)
+                g.drink_release(0, ALL)
             }
             step(&mut g, 0.1);
         }
@@ -2687,7 +2793,7 @@ mod tests {
                 break;
             }
             if g.can_run(0) {
-                g.pad_press(0, f);
+                g.pad_press(0, ALL, f);
                 f = if f == Foot::L { Foot::R } else { Foot::L };
             }
             step(&mut g, 0.15);
@@ -2714,13 +2820,13 @@ mod tests {
                 perfect(&mut g);
             }
             if g.can_drink(0) {
-                g.drink_press(0);
+                g.drink_press(0, ALL);
             } else {
-                g.drink_release(0);
+                g.drink_release(0, ALL);
             }
             if g.can_run(0) {
                 let f = if (g.clock * 7.0) as i32 % 2 == 0 { Foot::L } else { Foot::R };
-                g.pad_press(0, f);
+                g.pad_press(0, ALL, f);
             }
             step(&mut g, 0.07);
         }

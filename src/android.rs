@@ -151,3 +151,64 @@ pub fn backends() -> egui_wgpu::wgpu::Backends {
         wgpu::Backends::GL
     }
 }
+
+// ---------- notifications ----------
+/// Who to check notifications for in the background, while the game is closed (`NotesJob` in Java):
+/// the server's HTTP address, friend code and secret. Empty, or `on` false: nobody, no checks.
+pub fn notes_account(http: &str, code: &str, secret: &str, on: bool) {
+    with(|env, a| {
+        let (h, c, s) = (JObject::from(env.new_string(http)?), JObject::from(env.new_string(code)?), JObject::from(env.new_string(secret)?));
+        env.call_method(a, "notesAccount", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Z)V", &[JValue::Object(&h), JValue::Object(&c), JValue::Object(&s), JValue::Bool(on as u8)])?;
+        Ok(())
+    });
+}
+/// Ask for permission to show notifications (Android 13 and up), if it hasn't been given.
+pub fn ask_notify() {
+    with(|env, a| {
+        env.call_method(a, "askNotify", "()V", &[])?;
+        Ok(())
+    });
+}
+/// A notification from the server. Shown only while the game isn't on screen, and each one once
+/// (the background check knows which it has had).
+pub fn notify(n: &crate::net::Note) {
+    with(|env, a| {
+        let (from, name, text, room) = (JObject::from(env.new_string(&n.from)?), JObject::from(env.new_string(&n.name)?), JObject::from(env.new_string(&n.text)?), JObject::from(env.new_string(&n.room)?));
+        env.call_method(a, "note", "(JILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V", &[JValue::Long(n.id as i64), JValue::Int(n.kind as i32), JValue::Object(&from), JValue::Object(&name), JValue::Object(&text), JValue::Object(&room)])?;
+        Ok(())
+    });
+}
+/// A `Note` message as it arrives on the friends socket's own thread.
+pub fn note_json(t: &str) {
+    if let Ok(crate::net::FromServer::Note { note }) = serde_json::from_str(t) {
+        notify(&note);
+    }
+}
+/// What a tapped notification asks for, once: "room:CODE" (an invite) or "chat:CODE" (a message).
+pub fn take_open() -> Option<String> {
+    with(|env, a| {
+        let o = env.call_method(a, "takeOpen", "()Ljava/lang/String;", &[])?.l()?;
+        text(env, o)
+    })
+    .flatten()
+    .filter(|s| !s.is_empty())
+}
+
+// ---------- updating ----------
+/// Download the newest APK and hand it to the system's installer (it asks the player).
+pub fn update(url: &str) {
+    with(|env, a| {
+        let u = JObject::from(env.new_string(url)?);
+        env.call_method(a, "update", "(Ljava/lang/String;)V", &[JValue::Object(&u)])?;
+        Ok(())
+    });
+}
+/// How the update is going: "" (not started), "get:<percent>", "install" (the installer is up), "err:<why>".
+pub fn update_state() -> String {
+    with(|env, a| {
+        let o = env.call_method(a, "updateState", "()Ljava/lang/String;", &[])?.l()?;
+        text(env, o)
+    })
+    .flatten()
+    .unwrap_or_default()
+}

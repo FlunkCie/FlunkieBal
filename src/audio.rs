@@ -315,23 +315,28 @@ mod imp {
     use super::{score, synth::Synth, Sfx};
     use ndk::audio::{AudioCallbackResult, AudioDirection, AudioFormat, AudioPerformanceMode, AudioSharingMode, AudioStream, AudioStreamBuilder};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
 
     /// Silent this long: let go of the audio device, also so it isn't held while the app is in the background.
     const IDLE: f32 = 3.0;
 
+    /// The synth is shared with AAudio's callback. Opening and starting the stream happens on a thread of
+    /// its own: on a phone either can take tens or hundreds of milliseconds, and done in the game's frame
+    /// that was the hitch on the first throw (the stream had gone quiet while you were aiming).
     pub struct Audio {
         synth: Arc<Mutex<Synth>>,
-        stream: Option<AudioStream>,
-        /// the callback stopped itself, or the device went away (headphones out)
         idle: Arc<AtomicBool>,
         broken: Arc<AtomicBool>,
+        wake: Option<mpsc::Sender<()>>,
         pub volume: f32,
     }
-    impl Audio {
-        pub fn new() -> Self {
-            Audio { synth: Arc::new(Mutex::new(Synth::default())), stream: None, idle: Arc::new(AtomicBool::new(true)), broken: Arc::new(AtomicBool::new(false)), volume: 0.8 }
-        }
+    struct Device {
+        synth: Arc<Mutex<Synth>>,
+        stream: Option<AudioStream>,
+        idle: Arc<AtomicBool>,
+        broken: Arc<AtomicBool>,
+    }
+    impl Device {
         fn open(&mut self) -> Result<AudioStream, String> {
             let (synth, idle, broken) = (self.synth.clone(), self.idle.clone(), self.broken.clone());
             let mut quiet = 0.0f32;
@@ -352,6 +357,7 @@ mod imp {
                         quiet = if s.busy() { 0.0 } else { quiet + frames as f32 / rate };
                     }
                     if quiet > IDLE {
+                        quiet = 0.0;
                         idle.store(true, Ordering::Release);
                         AudioCallbackResult::Stop
                     } else {
@@ -365,33 +371,71 @@ mod imp {
                 .open_stream()
                 .map_err(|e| format!("{e:?}"))
         }
-        /// Make sure the stream is running.
-        fn wake(&mut self) {
+        /// Have a stream ready (opening is the slow part), without starting it.
+        fn ready(&mut self) {
             if self.broken.swap(false, Ordering::AcqRel) {
                 self.stream = None;
                 self.idle.store(true, Ordering::Release);
             }
+            if self.stream.is_none() {
+                let t = std::time::Instant::now();
+                match self.open() {
+                    Ok(s) => {
+                        log::info!("audio: stream opened in {:.0} ms (on its own thread)", t.elapsed().as_secs_f64() * 1000.0);
+                        self.stream = Some(s);
+                    }
+                    Err(e) => log::warn!("no audio: {e}"),
+                }
+            }
+        }
+        /// Make sure the stream is running.
+        fn wake(&mut self) {
+            self.ready();
             if !self.idle.load(Ordering::Acquire) {
                 return;
             }
-            if self.stream.is_none() {
-                match self.open() {
-                    Ok(s) => self.stream = Some(s),
-                    Err(e) => {
-                        log::warn!("no audio: {e}");
-                        return;
-                    }
-                }
-            }
             if let Some(s) = self.stream.as_ref() {
+                let t = std::time::Instant::now();
                 match s.request_start() {
-                    Ok(()) => self.idle.store(false, Ordering::Release),
+                    Ok(()) => {
+                        log::info!("audio: started in {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
+                        self.idle.store(false, Ordering::Release);
+                    }
                     Err(e) => {
                         log::warn!("audio didn't start: {e:?}");
+                        // try a fresh one, now rather than on the next sound
                         self.stream = None;
+                        self.ready();
+                        if let Some(s) = self.stream.as_ref() {
+                            if s.request_start().is_ok() {
+                                self.idle.store(false, Ordering::Release);
+                            }
+                        }
                     }
                 }
             }
+        }
+    }
+    impl Audio {
+        pub fn new() -> Self {
+            let synth = Arc::new(Mutex::new(Synth::default()));
+            let (idle, broken) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
+            let (tx, rx) = mpsc::channel::<()>();
+            let (sy, id, br) = (synth.clone(), idle.clone(), broken.clone());
+            let ok = std::thread::Builder::new()
+                .name("flunki-audio".into())
+                .spawn(move || {
+                    // the stream lives and dies on this thread
+                    let mut dev = Device { synth: sy, stream: None, idle: id, broken: br };
+                    dev.ready();
+                    while rx.recv().is_ok() {
+                        // a burst of sounds is one wake-up
+                        while rx.try_recv().is_ok() {}
+                        dev.wake();
+                    }
+                })
+                .is_ok();
+            Audio { synth, idle, broken, wake: ok.then_some(tx), volume: 0.8 }
         }
         pub fn unlock(&mut self) {}
         pub fn play(&mut self, s: Sfx) {
@@ -399,7 +443,12 @@ mod imp {
                 y.volume = self.volume;
                 score(s, &mut *y);
             }
-            self.wake();
+            // only the audio thread touches the device; tell it when there's something to do
+            if self.idle.load(Ordering::Acquire) || self.broken.load(Ordering::Acquire) {
+                if let Some(w) = self.wake.as_ref() {
+                    let _ = w.send(());
+                }
+            }
         }
     }
 }

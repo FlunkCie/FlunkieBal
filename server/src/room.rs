@@ -270,10 +270,15 @@ impl Room {
     fn refresh_sides(&mut self) {
         let ms = self.members();
         set_sides(&mut self.game, &ms, None);
+        // players can change hands: each drinks on only while whoever works them now holds DRINK
         for t in 0..2 {
-            let hold = self.seats.iter().any(|s| s.m.team as usize == t && s.hold);
-            if !hold {
-                self.game.drink_release(t);
+            for i in 0..3 {
+                let hold = owner_of(&ms, t, i).and_then(|m| self.seats.iter().find(|s| s.m.id == m.id)).map_or(false, |s| s.hold);
+                if !hold {
+                    let mut who = [false; 3];
+                    who[i] = true;
+                    self.game.drink_release(t, who);
+                }
             }
         }
         self.game.sides_changed();
@@ -285,8 +290,14 @@ impl Room {
             self.send(id, &FromServer::Err { msg: "You can't switch teams during a match".into(), fatal: false });
             return;
         }
+        let t = t.min(1);
+        let full = self.seats.iter().filter(|s| s.m.team == t && s.m.id != id).count() >= TEAM_MAX;
+        if full {
+            self.send(id, &FromServer::Err { msg: "That team is full: three a side".into(), fatal: false });
+            return;
+        }
         if let Some(s) = self.seat(id) {
-            s.m.team = t.min(1);
+            s.m.team = t;
         }
         self.roster();
     }
@@ -379,6 +390,8 @@ impl Room {
         if self.phase != PHASE_PLAYING {
             return;
         }
+        // everyone works their own players: their own beer, their own runner
+        let who = owned(&self.members(), team, id);
         let paused = self.pause.is_some();
         match i {
             Input::Throw { o, yaw, dist, curve, ring } => {
@@ -419,10 +432,10 @@ impl Room {
                         return;
                     }
                     self.game.tap_ms = self.tap_time(id, at);
-                    self.game.drink_press(team);
+                    self.game.drink_press(team, who);
                     self.game.tap_ms = None;
-                } else if !self.seats.iter().any(|s| s.m.team as usize == team && s.hold) {
-                    self.game.drink_release(team);
+                } else {
+                    self.game.drink_release(team, who);
                 }
             }
             Input::Pad { foot, at } => {
@@ -430,12 +443,12 @@ impl Room {
                     return;
                 }
                 self.game.tap_ms = self.tap_time(id, at);
-                self.game.pad_press(team, if foot == 0 { Foot::L } else { Foot::R });
+                self.game.pad_press(team, who, if foot == 0 { Foot::L } else { Foot::R });
                 self.game.tap_ms = None;
             }
             Input::Sneak => {
                 if !paused {
-                    self.game.start_sneak_for(team);
+                    self.game.start_sneak_for(team, who);
                 }
             }
         }

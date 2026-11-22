@@ -90,6 +90,45 @@ pub fn setup_style(ctx: &egui::Context) {
     });
 }
 
+/// The size of the big banner title on a screen this wide.
+pub(crate) fn banner_size(w: f32) -> f32 {
+    crate::app::anton_size((w * 0.12).clamp(34.0, 64.0))
+}
+
+/// Lay out every font and size the game uses, once, while it starts. Each size seen for the first
+/// time puts its glyphs in egui's atlas, and a full atlas grows by doubling and goes to the GPU whole:
+/// that was the hitch on opening a page, on the first throw and on the first HIT!.
+pub fn warm_fonts(ctx: &egui::Context, w: f32) {
+    let mut text: String = (32u8..127).map(|c| c as char).collect();
+    text.push_str("…·×–—’éëüöï€");
+    let icons: String = crate::icons::ALL.concat();
+    let prop = [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 20.0, 22.0, 26.0, 29.0];
+    let bolds = [11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0];
+    let antons = crate::app::ANTON_SIZES;
+    let _ = w;
+    ctx.fonts_mut(|f| {
+        let mut go = |id: FontId, icons_too: bool| {
+            // a few offsets, so the glyphs land on more than one sub-pixel position
+            for pre in [""] {
+                let _ = f.layout_no_wrap(format!("{pre}{text}"), id.clone(), Color32::WHITE);
+            }
+            if icons_too {
+                let _ = f.layout_no_wrap(icons.clone(), id, Color32::WHITE);
+            }
+        };
+        for s in prop {
+            go(FontId::proportional(s), true);
+        }
+        for s in bolds {
+            go(bold(s), false);
+        }
+        for s in antons {
+            go(anton(s), false);
+        }
+        go(FontId::monospace(10.0), false);
+    });
+}
+
 fn bold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("bold".into()))
 }
@@ -167,7 +206,7 @@ fn small_btn(ui: &mut Ui, text: &str) -> egui::Response {
 }
 fn seg(ui: &mut Ui, text: &str, sel: bool, locked: bool, w: f32) -> egui::Response {
     let label = if locked && !sel { format!("{LOCK} {text}") } else { text.to_string() };
-    let rt = RichText::new(label).size(14.5).color(if sel { INK } else if locked { Color32::from_white_alpha(110) } else { Color32::WHITE });
+    let rt = RichText::new(label).size(15.0).color(if sel { INK } else if locked { Color32::from_white_alpha(110) } else { Color32::WHITE });
     ui.add(egui::Button::new(rt).fill(if sel { Color32::from_rgb(0xff, 0xe0, 0x8a) } else { Color32::from_white_alpha(16) }).corner_radius(CornerRadius::same(10)).min_size(vec2(w, 36.0)))
 }
 /// A card-style button with a title and a line under it.
@@ -186,7 +225,7 @@ fn heading(ui: &mut Ui, t: &str) {
     ui.label(RichText::new(t).font(anton(28.0)).color(GOLD));
 }
 fn label_caps(ui: &mut Ui, t: &str) {
-    ui.label(RichText::new(t.to_uppercase()).size(11.5).color(MUTED).font(bold(16.0)));
+    ui.label(RichText::new(t.to_uppercase()).size(12.0).color(MUTED).font(bold(16.0)));
 }
 fn swatch(ui: &mut Ui, c: u32, sel: bool, locked: bool) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(vec2(38.0, 38.0), Sense::click());
@@ -218,14 +257,15 @@ fn xp_box(ui: &mut Ui, x: &XpResult, w: f32) {
         let f = if x.after.need > 0 { x.after.into as f32 / x.after.need as f32 } else { 1.0 };
         ui.painter().rect_filled(Rect::from_min_size(r.min, vec2(r.width() * f, r.height())), 4.0, GOLD);
         if !x.parts.is_empty() {
-            ui.label(RichText::new(x.parts.join(" · ")).size(12.5).color(MUTED));
+            ui.label(RichText::new(x.parts.join(" · ")).size(13.0).color(MUTED));
         }
         if !x.unlocked.is_empty() {
             label_caps(ui, "Unlocked");
             ui.horizontal_wrapped(|ui| {
                 for u in &x.unlocked {
                     egui::Frame::NONE.fill(Color32::from_rgba_premultiplied(60, 50, 10, 220)).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
-                        ui.label(RichText::new(format!("{LOCK_OPEN} {u}")).size(13.0).color(Color32::WHITE));
+                        // whole chips go to the next line: a chip that wraps itself ends up a letter wide
+                        ui.add(egui::Label::new(RichText::new(format!("{LOCK_OPEN} {u}")).size(13.0).color(Color32::WHITE)).wrap_mode(egui::TextWrapMode::Extend));
                     });
                 }
             });
@@ -233,7 +273,7 @@ fn xp_box(ui: &mut Ui, x: &XpResult, w: f32) {
     });
 }
 
-/// Who you are, as the chip and the profile menu show it: name, a line under it, and whether there's anyone.
+/// Who you are, as the chip and the clubhouse card show it: name, a line under it, and whether there's anyone.
 fn who_am_i(app: &FlunkiApp) -> (String, bool) {
     if app.save.locked() {
         ("Guest".into(), false)
@@ -263,33 +303,40 @@ fn avatar(p: &egui::Painter, c: Pos2, r: f32, app: &FlunkiApp, someone: bool) {
         p.text(c + vec2(0.0, 1.0), Align2::CENTER_CENTER, initial, anton(r * 1.05), INK);
     } else {
         p.circle_filled(c, r, Color32::from_white_alpha(22));
-        p.text(c, Align2::CENTER_CENTER, USER, FontId::proportional(r * 1.05), MUTED);
+        p.text(c, Align2::CENTER_CENTER, USER, FontId::proportional((r * 1.05).round()), MUTED);
+    }
+}
+/// Soft gold light behind something: rings fading out.
+fn glow(p: &egui::Painter, c: Pos2, r: f32, a: u8) {
+    for k in 0..8 {
+        let t = k as f32 / 8.0;
+        p.circle_filled(c, r * (1.0 - t * 0.6), Color32::from_rgba_unmultiplied(0xf2, 0xb6, 0x32, (a as f32 * (0.12 + t * 0.1)) as u8));
     }
 }
 fn hex_col(c: u32) -> Color32 {
     Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
 
-/// Top right: your avatar in its XP ring, your name and level. Opens the profile menu.
+/// Top right on the main menu: your avatar in its XP ring, your name and level. Takes you to the clubhouse, where all of that lives.
 fn level_chip(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
     let lv = save::level_of(app.save.xp);
     let (name, someone) = who_am_i(app);
     let f = if lv.need > 0 { lv.into as f32 / lv.need as f32 } else { 1.0 };
-    let name_f = bold(15.5);
+    let name_f = bold(16.0);
     let name_g = ctx.fonts_mut(|fo| fo.layout_no_wrap(name.clone(), name_f.clone(), Color32::WHITE));
     let sub = if someone || !save::needs_login() { format!("LEVEL {}", lv.lv) } else { format!("{SIGN_IN}  LOG IN") };
-    let sub_g = ctx.fonts_mut(|fo| fo.layout_no_wrap(sub.clone(), bold(11.5), GOLD));
+    let sub_g = ctx.fonts_mut(|fo| fo.layout_no_wrap(sub.clone(), bold(12.0), GOLD));
     let w = (52.0 + name_g.size().x.max(sub_g.size().x) + 18.0).clamp(120.0, 230.0);
     egui::Area::new(egui::Id::new("lvchip")).fixed_pos(pos2(sr.right() - 12.0 - w, sr.top() + 12.0)).show(ctx, |ui| {
         let (r, resp) = ui.allocate_exact_size(vec2(w, 46.0), Sense::click());
         let p = ui.painter();
         let hot = resp.hovered();
         p.rect_filled(r, 23.0, PANEL);
-        // a hint of gold from the left, where the level is
-        let glow = Rect::from_min_size(r.min, vec2(r.height() + 20.0, r.height()));
-        p.rect_filled(glow, 23.0, Color32::from_rgba_unmultiplied(0xf2, 0xb6, 0x32, if hot { 30 } else { 16 }));
         p.rect_stroke(r, 23.0, Stroke::new(1.0, if someone { Color32::from_rgba_unmultiplied(0xf2, 0xb6, 0x32, if hot { 150 } else { 90 }) } else { Color32::from_white_alpha(if hot { 70 } else { 40 }) }), StrokeKind::Inside);
         let c = r.left_center() + vec2(23.0, 0.0);
+        if someone {
+            glow(p, c, 26.0, if hot { 46 } else { 30 });
+        }
         avatar(p, c, 14.5, app, someone);
         xp_ring(p, c, 18.5, 2.5, if someone || !save::needs_login() { f } else { 0.0 });
         let tx = r.left() + 50.0;
@@ -298,117 +345,57 @@ fn level_chip(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
         pc.galley(pos2(tx, r.top() + 7.0), name_g, Color32::WHITE);
         pc.galley(pos2(tx, r.top() + 27.0), sub_g, GOLD);
         if resp.clicked() {
-            app.sheet = Sheet::Me;
+            app.audio.unlock();
+            app.view = View::Club;
         }
     });
 }
 
-/// The profile menu: who you are, how far along, your numbers, and the way to everything else about you.
-fn me_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
-    let mut close = false;
-    let mut go: Option<Sheet> = None;
-    let mut log_out = false;
+/// Your card in the clubhouse: avatar in its ring, name, account, level and XP. Tap to dress up.
+fn profile_card(app: &FlunkiApp, ui: &mut Ui, w: f32) -> egui::Response {
     let lv = save::level_of(app.save.xp);
     let (name, someone) = who_am_i(app);
     let locked = app.save.locked();
-    sheet(ctx, sr, "me", sr.height() * 0.82, |ui, w| {
-        if sheet_head(ui, "Profile") {
-            close = true;
-        }
-        // the card: avatar in its ring, name, account, level and XP
-        let (r, _) = ui.allocate_exact_size(vec2(w, 112.0), Sense::hover());
-        let p = ui.painter();
-        p.rect_filled(r, 16.0, CARD);
-        p.rect_filled(Rect::from_min_size(r.min, vec2(118.0, r.height())), 16.0, Color32::from_rgba_unmultiplied(0xf2, 0xb6, 0x32, 14));
-        let c = r.left_center() + vec2(56.0, -6.0);
-        avatar(p, c, 31.0, app, someone);
-        let f = if lv.need > 0 { lv.into as f32 / lv.need as f32 } else { 1.0 };
-        xp_ring(p, c, 38.0, 4.0, if someone || !save::needs_login() { f } else { 0.0 });
-        // the level, on a badge under the avatar
-        let lvt = format!("LV {}", lv.lv);
-        let g = p.layout_no_wrap(lvt, anton(14.0), INK);
-        let badge = Rect::from_center_size(c + vec2(0.0, 40.0), g.size() + vec2(16.0, 4.0));
-        p.rect_filled(badge, badge.height() / 2.0, GOLD);
-        p.rect_stroke(badge, badge.height() / 2.0, Stroke::new(2.0, CARD), StrokeKind::Outside);
-        p.galley(badge.center() - g.size() / 2.0, g, INK);
-        let tx = r.left() + 116.0;
-        let pc = p.with_clip_rect(r.shrink(8.0));
-        pc.text(pos2(tx, r.top() + 14.0), Align2::LEFT_TOP, &name, anton(26.0), Color32::WHITE);
-        let (status, col) = if app.save.logged_in() && !locked {
-            (format!("{CHECK}  Logged in as {}", app.save.user), GOOD)
-        } else if locked {
-            (format!("{LOCK}  Guest: nothing is kept"), WARN)
-        } else {
-            ("This device's player".to_string(), MUTED)
-        };
-        pc.text(pos2(tx, r.top() + 50.0), Align2::LEFT_TOP, status, FontId::proportional(14.0), col);
-        let bar = Rect::from_min_size(pos2(tx, r.top() + 78.0), vec2(r.right() - tx - 16.0, 8.0));
-        p.rect_filled(bar, 4.0, Color32::from_white_alpha(25));
-        p.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * f, 8.0)), 4.0, GOLD);
-        pc.text(pos2(tx, bar.bottom() + 5.0), Align2::LEFT_TOP, format!("{} / {} XP to level {}", lv.into, lv.need, lv.lv + 1), FontId::proportional(12.0), MUTED);
-
-        // your numbers
-        let mine: Vec<&save::MatchRec> = app.save.matches.iter().filter(|m| m.win.is_some()).collect();
-        let wins = mine.iter().filter(|m| m.win == Some(true)).count();
-        let (throws, hits) = mine.iter().fold((0u32, 0u32), |a, m| (a.0 + m.throws, a.1 + m.hits));
-        let pct = |a: u32, b: u32| if b > 0 { format!("{}%", (a as f32 / b as f32 * 100.0).round()) } else { "–".into() };
-        let tiles = [(FIRE, app.save.matches.len().to_string(), "MATCHES"), (TROPHY, wins.to_string(), "WINS"), (TARGET, pct(hits, throws), "HIT RATE")];
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            let tw = (w - 16.0) / 3.0;
-            for (icon, v, label) in tiles {
-                let (t, _) = ui.allocate_exact_size(vec2(tw, 70.0), Sense::hover());
-                let p = ui.painter();
-                p.rect_filled(t, 12.0, CARD);
-                p.text(t.center_top() + vec2(0.0, 15.0), Align2::CENTER_CENTER, icon, FontId::proportional(15.0), GOLD);
-                p.text(t.center() + vec2(0.0, 4.0), Align2::CENTER_CENTER, v, anton(22.0), Color32::WHITE);
-                p.text(t.center_bottom() + vec2(0.0, -11.0), Align2::CENTER_CENTER, label, bold(10.5), MUTED);
-            }
-        });
-        // what's next
-        if let Some(next) = (lv.lv + 1..=save::TOP_UNLOCK).find(|l| save::UNLOCKS.iter().any(|u| u.0 == *l)) {
-            let items: Vec<&str> = save::UNLOCKS.iter().filter(|u| u.0 == next).map(|u| u.2).collect();
-            ui.add_space(2.0);
-            egui::Frame::NONE.fill(Color32::from_rgba_unmultiplied(0xf2, 0xb6, 0x32, 18)).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::symmetric(12, 9)).show(ui, |ui| {
-                ui.set_width(w - 24.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(format!("{STAR} Level {next}")).color(GOLD).font(bold(15.0)));
-                    ui.label(RichText::new(items.join(", ")).color(Color32::WHITE).size(14.0));
-                });
-            });
-        } else if lv.lv >= save::TOP_UNLOCK {
-            ui.label(RichText::new(format!("{CROWN} Everything unlocked. Flunk royalty.")).color(GOLD).font(bold(15.0)));
-        }
-        ui.add_space(2.0);
-        let rows: [(&str, &str, String, Sheet); 5] = [
-            (TSHIRT, "YOUR PLAYER", if locked { format!("{LOCK} Log in to dress up") } else { "Shirt, hair, hat and voice".into() }, Sheet::Profile),
-            (STAR, "PROGRESS", "Levels and what they unlock".into(), Sheet::Progress),
-            (STATS, "STATS", format!("{} matches played", app.save.matches.len()), Sheet::Stats),
-            (FRIENDS, "FRIENDS", friends_line(app), Sheet::Friends),
-            (GEAR, "SETTINGS", "Sound, controls, account".into(), Sheet::Settings),
-        ];
-        for (icon, title, sub, to) in rows {
-            if row_btn(ui, icon, title, &sub, w).clicked() {
-                go = Some(to);
-            }
-        }
-        ui.add_space(4.0);
-        if !app.save.logged_in() || locked {
-            if big(ui, &format!("{SIGN_IN}  LOG IN OR SIGN UP"), true, w).clicked() {
-                go = Some(Sheet::Account);
-            }
-        } else if ui.add(egui::Button::new(RichText::new(format!("{SIGN_OUT}  LOG OUT")).font(anton(17.0)).color(BAD)).fill(Color32::from_white_alpha(8)).stroke(Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xff, 0x5a, 0x4a, 90))).corner_radius(CornerRadius::same(12)).min_size(vec2(w, 48.0))).clicked() {
-            log_out = true;
-        }
-    });
-    if log_out {
-        app.log_out();
-    } else if let Some(s) = go {
-        app.sheet = s;
-    } else if close {
-        app.sheet = Sheet::None;
+    let (r, resp) = ui.allocate_exact_size(vec2(w, 104.0), Sense::click());
+    let hot = resp.hovered();
+    let p = ui.painter();
+    p.rect_filled(r, 16.0, if hot { Color32::from_white_alpha(20) } else { CARD });
+    p.rect_stroke(r, 16.0, Stroke::new(1.0, if someone { Color32::from_rgba_unmultiplied(0xf2, 0xb6, 0x32, if hot { 120 } else { 60 }) } else { Color32::from_white_alpha(30) }), StrokeKind::Inside);
+    let c = r.left_center() + vec2(52.0, -6.0);
+    if someone {
+        glow(p, c, 50.0, if hot { 44 } else { 32 });
     }
+    avatar(p, c, 28.0, app, someone);
+    let f = if lv.need > 0 { lv.into as f32 / lv.need as f32 } else { 1.0 };
+    xp_ring(p, c, 35.0, 4.0, if someone || !save::needs_login() { f } else { 0.0 });
+    // the level, on a badge under the avatar
+    let g = p.layout_no_wrap(format!("LV {}", lv.lv), anton(13.5), INK);
+    let badge = Rect::from_center_size(c + vec2(0.0, 37.0), g.size() + vec2(16.0, 4.0));
+    p.rect_filled(badge, badge.height() / 2.0, GOLD);
+    p.rect_stroke(badge, badge.height() / 2.0, Stroke::new(2.0, CARD), StrokeKind::Outside);
+    p.galley(badge.center() - g.size() / 2.0, g, INK);
+    let tx = r.left() + 106.0;
+    let hint = if locked { format!("{SIGN_IN} LOG IN") } else { format!("{TSHIRT} CUSTOMIZE") };
+    let hg = p.layout_no_wrap(hint, bold(12.0), GOLD);
+    let hx = r.right() - 14.0 - hg.size().x;
+    p.galley(pos2(hx, r.top() + 14.0), hg, GOLD);
+    // clipped short of the hint, should a name be long
+    let pc = p.with_clip_rect(Rect::from_min_max(r.min, pos2(hx - 8.0, r.bottom())));
+    pc.text(pos2(tx, r.top() + 11.0), Align2::LEFT_TOP, &name, anton(24.0), Color32::WHITE);
+    let (status, col) = if app.save.logged_in() && !locked {
+        (format!("{CHECK}  Logged in as {}", app.save.user), GOOD)
+    } else if locked {
+        (format!("{LOCK}  Guest: nothing is kept"), WARN)
+    } else {
+        ("This device's player".to_string(), MUTED)
+    };
+    let pc = p.with_clip_rect(r.shrink(8.0));
+    pc.text(pos2(tx, r.top() + 45.0), Align2::LEFT_TOP, status, FontId::proportional(14.0), col);
+    let bar = Rect::from_min_size(pos2(tx, r.top() + 70.0), vec2(r.right() - tx - 16.0, 8.0));
+    p.rect_filled(bar, 4.0, Color32::from_white_alpha(25));
+    p.rect_filled(Rect::from_min_size(bar.min, vec2(bar.width() * f, 8.0)), 4.0, GOLD);
+    pc.text(pos2(tx, bar.bottom() + 5.0), Align2::LEFT_TOP, format!("{} / {} XP to level {}", lv.into, lv.need, lv.lv + 1), FontId::proportional(12.0), MUTED);
+    resp
 }
 
 // ---------- the whole UI ----------
@@ -508,12 +495,12 @@ pub fn draw(app: &mut FlunkiApp, ctx: &egui::Context, p: &egui::Painter, sr: Rec
             Sheet::Rules => rules_sheet(app, ctx, sr),
             Sheet::Friends => friends_sheet(app, ctx, sr),
             Sheet::Account => account_sheet(app, ctx, sr),
-            Sheet::Me => me_sheet(app, ctx, sr),
+            Sheet::Bug => bug_sheet(app, ctx, sr),
             Sheet::None => {}
         }
     }
     if let Some((t, life)) = &app.lock_note {
-        let gal = p.layout_no_wrap(t.clone(), FontId::proportional(14.5), Color32::WHITE);
+        let gal = p.layout_no_wrap(t.clone(), FontId::proportional(15.0), Color32::WHITE);
         let r = Rect::from_center_size(pos2(sr.center().x, sr.top() + 70.0), gal.size() + vec2(24.0, 14.0));
         let a = (life / 0.3).min(1.0);
         ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("locknote"))).rect_filled(r, 12.0, fade(Color32::from_rgb(0x3a, 0x2a, 0x0a), a));
@@ -573,13 +560,14 @@ fn main_menu(app: &mut FlunkiApp, ctx: &egui::Context, p: &egui::Painter, sr: Re
         panel().show(ui, |ui| {
             let iw = bw - 32.0;
             ui.set_width(iw);
+            update_row(app, ui, iw);
             let rt = RichText::new(format!("PLAY A MATCH  {ARROW_RIGHT}")).font(anton(26.0)).color(INK);
             if ui.add(egui::Button::new(rt).fill(GOLD).corner_radius(CornerRadius::same(14)).min_size(vec2(iw, 64.0))).clicked() {
                 app.audio.unlock();
                 app.screen = Screen::Play;
                 app.step = PlayStep::Choose;
             }
-            if row_btn(ui, HOUSE, "CLUBHOUSE", &format!("{name} · training · stats"), iw).clicked() {
+            if row_btn(ui, HOUSE, "CLUBHOUSE", &format!("{name} · training · stats · account"), iw).clicked() {
                 app.audio.unlock();
                 app.view = View::Club;
             }
@@ -600,53 +588,80 @@ fn main_menu(app: &mut FlunkiApp, ctx: &egui::Context, p: &egui::Painter, sr: Re
     });
 }
 
+/// The clubhouse is you: your card, training, your numbers, friends and your account.
 fn clubhouse(app: &mut FlunkiApp, ctx: &egui::Context, p: &egui::Painter, sr: Rect) {
-    vgrad(p, Rect::from_min_max(pos2(full_rect().left(), sr.bottom() - sr.height() * 0.3), full_rect().max), 0, 170);
+    vgrad(p, Rect::from_min_max(pos2(full_rect().left(), sr.bottom() - sr.height() * 0.45), full_rect().max), 0, 170);
     if brand_pill(ctx, sr, "THE CLUBHOUSE", true) {
         app.view = View::Menu;
     }
-    level_chip(app, ctx, sr);
     if app.sheet != Sheet::None {
         return;
     }
     let bw = (sr.width() - 24.0).min(440.0);
+    let locked = app.save.locked();
     let n = app.save.matches.len();
     let recs = app.save.train_pb.iter().filter(|v| v.is_some()).count();
-    let name = app.save.profile.name.clone();
-    let col = save::SWATCHES[app.save.profile.color];
+    let mine: Vec<&save::MatchRec> = app.save.matches.iter().filter(|m| m.win.is_some()).collect();
+    let wins = mine.iter().filter(|m| m.win == Some(true)).count();
+    let lv = save::level_of(app.save.xp).lv;
+    let mut go: Option<Sheet> = None;
+    let mut log_out = false;
     egui::Area::new(egui::Id::new("clubdock")).pivot(Align2::CENTER_BOTTOM).fixed_pos(anc(Align2::CENTER_BOTTOM, vec2(0.0, -14.0))).show(ctx, |ui| {
-        let iw = bw;
-        ui.set_width(iw);
-        // who you are, with a way into the customizer
-        let (r, resp) = ui.allocate_exact_size(vec2(iw, 64.0), Sense::click());
-        {
-            let p = ui.painter();
-            p.rect_filled(r, 16.0, PANEL);
-            p.rect_stroke(r, 16.0, Stroke::new(1.0, Color32::from_white_alpha(28)), StrokeKind::Inside);
-            p.circle_filled(r.left_center() + vec2(26.0, 0.0), 12.0, Color32::from_rgb((col >> 16) as u8, (col >> 8) as u8, col as u8));
-            p.circle_stroke(r.left_center() + vec2(26.0, 0.0), 12.0, Stroke::new(2.0, Color32::from_white_alpha(80)));
-            p.text(r.left_top() + vec2(50.0, 13.0), Align2::LEFT_TOP, "PLAYING AS", FontId::proportional(10.5), MUTED);
-            p.text(r.left_top() + vec2(50.0, 28.0), Align2::LEFT_TOP, &name, anton(20.0), Color32::WHITE);
-            p.text(r.right_center() - vec2(18.0, 0.0), Align2::RIGHT_CENTER, "CUSTOMIZE", anton(14.0), GOLD);
-        }
-        if resp.clicked() {
-            app.name_edit = app.save.profile.name.clone();
-            app.sheet = Sheet::Profile;
-        }
-        ui.horizontal(|ui| {
-            let hw = (iw - 10.0) / 2.0;
-            let sub = if !app.save.tut_done { "Start here".to_string() } else if recs > 0 { format!("{recs} of 3 records set") } else { "Throw · drink · run".into() };
-            let tr = egui::Frame::NONE.fill(PANEL).corner_radius(CornerRadius::same(14)).inner_margin(egui::Margin::same(4)).show(ui, |ui| row_btn(ui, TRAINING, "TRAINING", &sub, hw - 8.0)).inner;
-            if tr.clicked() {
-                app.sheet = Sheet::Train;
+        panel().show(ui, |ui| {
+            let iw = bw - 32.0;
+            ui.set_width(iw);
+            if profile_card(app, ui, iw).clicked() {
+                go = Some(if locked { Sheet::Account } else { Sheet::Profile });
             }
-            let sub = if n > 0 { format!("{n} {} played", if n == 1 { "match" } else { "matches" }) } else { "Your player file".into() };
-            let st = egui::Frame::NONE.fill(PANEL).corner_radius(CornerRadius::same(14)).inner_margin(egui::Margin::same(4)).show(ui, |ui| row_btn(ui, STATS, "STATS", &sub, hw - 8.0)).inner;
-            if st.clicked() {
-                app.sheet = Sheet::Stats;
+            let hw = (iw - 8.0) / 2.0;
+            let train = if !app.save.tut_done { "Start here".to_string() } else if recs > 0 { format!("{recs} of 3 records set") } else { "Throw · drink · run".into() };
+            let progress = match (lv + 1..=save::TOP_UNLOCK).find(|l| save::UNLOCKS.iter().any(|u| u.0 == *l)) {
+                _ if locked => format!("{LOCK} Log in to level up"),
+                Some(next) => format!("Next unlock: level {next}"),
+                None => format!("{CROWN} Everything unlocked"),
+            };
+            let stats = if n == 0 { "Your player file".to_string() } else { format!("{n} played · {wins} won") };
+            let (acc_icon, acc, acc_sub) = if app.save.logged_in() && !locked {
+                (SIGN_OUT, "LOG OUT", app.save.user.clone())
+            } else if locked {
+                (SIGN_IN, "LOG IN", "Or sign up".to_string())
+            } else {
+                (SIGN_IN, "LOG IN", "Keep your player safe".to_string())
+            };
+            let rows: [[(&str, &str, String, Option<Sheet>); 2]; 3] = [
+                [(TRAINING, "TRAINING", train, Some(Sheet::Train)), (STAR, "PROGRESS", progress, Some(Sheet::Progress))],
+                [(STATS, "STATS", stats, Some(Sheet::Stats)), (FRIENDS, "FRIENDS", friends_line(app), Some(Sheet::Friends))],
+                [(GEAR, "SETTINGS", "Sound, controls".into(), Some(Sheet::Settings)), (acc_icon, acc, acc_sub, if acc == "LOG OUT" { None } else { Some(Sheet::Account) })],
+            ];
+            for row in rows {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    for (icon, title, sub, to) in row {
+                        let ui_w = hw;
+                        let r = ui.allocate_ui(vec2(ui_w, 58.0), |ui| {
+                            // a long line stays inside its button
+                            ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
+                            row_btn(ui, icon, title, &sub, ui_w)
+                        }).inner;
+                        if r.clicked() {
+                            match to {
+                                Some(s) => go = Some(s),
+                                None => log_out = true,
+                            }
+                        }
+                    }
+                });
             }
         });
     });
+    if log_out {
+        app.log_out();
+    } else if let Some(s) = go {
+        if s == Sheet::Profile {
+            app.name_edit = app.save.profile.name.clone();
+        }
+        app.sheet = s;
+    }
 }
 
 fn arena_picker(app: &mut FlunkiApp, ui: &mut Ui, w: f32) {
@@ -665,8 +680,8 @@ fn arena_picker(app: &mut FlunkiApp, ui: &mut Ui, w: f32) {
                     p.rect_stroke(r, 12.0, Stroke::new(2.0, GOLD), StrokeKind::Inside);
                 }
                 let tc = if locked { Color32::from_white_alpha(110) } else { Color32::WHITE };
-                p.text(r.left_top() + vec2(12.0, 9.0), Align2::LEFT_TOP, k.name(), FontId::proportional(15.5), tc);
-                p.text(r.left_top() + vec2(12.0, 31.0), Align2::LEFT_TOP, if locked { format!("{LOCK} Level {need}") } else { k.blurb().chars().take(30).collect::<String>() }, FontId::proportional(11.5), if locked { WARN } else { MUTED });
+                p.text(r.left_top() + vec2(12.0, 9.0), Align2::LEFT_TOP, k.name(), FontId::proportional(16.0), tc);
+                p.text(r.left_top() + vec2(12.0, 31.0), Align2::LEFT_TOP, if locked { format!("{LOCK} Level {need}") } else { k.blurb().chars().take(30).collect::<String>() }, FontId::proportional(12.0), if locked { WARN } else { MUTED });
                 if resp.clicked() {
                     if locked {
                         app.lock_note = Some((format!("{LOCK} {} unlocks at level {need} · you are level {}", k.name(), app.save.level()), 2.6));
@@ -732,7 +747,7 @@ fn play_panel(app: &mut FlunkiApp, ctx: &egui::Context, p: &egui::Painter, sr: R
                     }
                 }
                 PlayStep::Hot => {
-                    ui.label(RichText::new("Left side of the screen is one team, right side the other.").color(MUTED).size(13.5));
+                    ui.label(RichText::new("Left side of the screen is one team, right side the other.").color(MUTED).size(14.0));
                     arena_picker(app, ui, iw);
                     if big(ui, "START", true, iw).clicked() {
                         app.start(Mode::Hot);
@@ -745,18 +760,25 @@ fn play_panel(app: &mut FlunkiApp, ctx: &egui::Context, p: &egui::Painter, sr: R
 }
 
 fn online_panel(app: &mut FlunkiApp, ui: &mut Ui, iw: f32) {
+    update_row(app, ui, iw);
     if app.save.locked() {
         login_box(app, ui, iw, "Log in to play online.");
         return;
     }
     let in_room = app.net.as_ref().map_or(false, |n| n.in_room);
     if !app.net_err.is_empty() {
-        ui.label(RichText::new(app.net_err.clone()).color(BAD).size(13.5));
+        ui.label(RichText::new(app.net_err.clone()).color(BAD).size(14.0));
     }
     if !in_room {
-        let connecting = app.net.as_ref().map_or(false, |n| n.sock.state() == 0);
-        if connecting {
-            ui.label(RichText::new("Connecting…").color(MUTED));
+        // the connection is kept in the background; say so only while it isn't there
+        match app.net.as_ref().map(|n| n.sock.state()) {
+            Some(1) => {}
+            Some(0) => {
+                ui.label(RichText::new("Connecting…").color(MUTED));
+            }
+            _ => {
+                ui.label(RichText::new("Offline · trying again in the background").color(WARN));
+            }
         }
         if big(ui, "HOST A MATCH", true, iw).clicked() {
             app.net_host();
@@ -791,7 +813,7 @@ fn online_panel(app: &mut FlunkiApp, ui: &mut Ui, iw: f32) {
         (n.code.clone(), n.host(), n.members.clone(), n.id, n.open)
     };
     if app.net.as_ref().map_or(false, |n| n.reconnect.is_some()) {
-        ui.label(RichText::new("Connection lost. Getting you back in…").color(WARN).size(13.5));
+        ui.label(RichText::new("Connection lost. Getting you back in…").color(WARN).size(14.0));
     }
     ui.horizontal(|ui| {
         ui.label(RichText::new("CODE").size(12.0).color(MUTED));
@@ -803,29 +825,29 @@ fn online_panel(app: &mut FlunkiApp, ui: &mut Ui, iw: f32) {
             }
         });
     });
-    let cw = (iw - 10.0) / 2.0;
+    let status = app.net.as_ref().map(|n| n.status.clone()).unwrap_or_default();
+    let my_team = members.iter().find(|m| m.id == my_id).map_or(0, |m| m.team);
+    let full = |t: u8| members.iter().filter(|m| m.team == t).count() >= net::TEAM_MAX;
+    // two cards side by side, always the same size: three rows each, a team has three players
+    let cw = ((iw - 8.0) / 2.0).floor();
+    let mut switch = false;
     ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
         for t in 0..2u8 {
-            ui.allocate_ui(vec2(cw, 140.0), |ui| {
-                egui::Frame::NONE.fill(CARD).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
-                    ui.set_width(cw - 20.0);
-                    ui.label(RichText::new(app.game.teams[t as usize].name).color(if t == 0 { GOLD } else { BLUE }).font(bold(16.0)));
-                    let hs: Vec<_> = members.iter().filter(|m| m.team == t).collect();
-                    for m in &hs {
-                        let you = if m.id == my_id { " (you)" } else { "" };
-                        let away = if m.away { " · reconnecting…" } else { "" };
-                        ui.label(RichText::new(format!("{}{you}{away}", m.name)).color(if m.away { WARN } else { Color32::WHITE }).size(14.5));
-                    }
-                    for _ in hs.len()..1 {
-                        ui.label(RichText::new("Computer").color(MUTED).size(14.5).italics());
-                    }
-                });
-            });
+            let other = t != my_team;
+            let joinable = other && !full(t);
+            let (r, resp) = ui.allocate_exact_size(vec2(cw, LOBBY_HEAD + 3.0 * LOBBY_ROW + 8.0), if joinable { Sense::click() } else { Sense::hover() });
+            if resp.clicked() {
+                switch = true;
+            }
+            team_card(ui.painter(), r, t, app.game.teams[t as usize].name, &members, &status, my_id, host_id(app), joinable, resp.hovered());
         }
     });
-    let my_team = members.iter().find(|m| m.id == my_id).map_or(0, |m| m.team);
+    if switch {
+        app.net_set_team(1 - my_team);
+    }
     ui.horizontal(|ui| {
-        if small_btn(ui, "Switch team").clicked() {
+        if !full(1 - my_team) && small_btn(ui, "Switch team").clicked() {
             app.net_set_team(1 - my_team);
         }
         if small_btn(ui, &format!("{FRIENDS} Invite friends")).clicked() {
@@ -844,6 +866,99 @@ fn online_panel(app: &mut FlunkiApp, ui: &mut Ui, iw: f32) {
     } else {
         let arena = ArenaKey::from_id(&app.net.as_ref().unwrap().arena);
         ui.label(RichText::new(format!("{} · waiting for the host to start", arena.name())).color(MUTED));
+    }
+}
+
+const LOBBY_HEAD: f32 = 34.0;
+const LOBBY_ROW: f32 = 40.0;
+fn host_id(app: &FlunkiApp) -> u32 {
+    app.net.as_ref().map_or(0, |n| n.host_id)
+}
+/// `s` cut short with an ellipsis so it fits in `w`.
+fn fit(p: &egui::Painter, s: &str, f: FontId, w: f32) -> String {
+    if p.layout_no_wrap(s.to_string(), f.clone(), Color32::WHITE).size().x <= w {
+        return s.to_string();
+    }
+    let cs: Vec<char> = s.chars().collect();
+    for n in (1..cs.len()).rev() {
+        let t: String = cs[..n].iter().collect::<String>().trim_end().to_string() + "…";
+        if p.layout_no_wrap(t.clone(), f.clone(), Color32::WHITE).size().x <= w {
+            return t;
+        }
+    }
+    "…".into()
+}
+/// One team in the lobby: its name and how full it is, then a row per person (shirt, name, level,
+/// host, connection) and what fills the empty spots. A long name is cut short, never widens the card.
+#[allow(clippy::too_many_arguments)]
+fn team_card(p: &egui::Painter, r: Rect, t: u8, name: &str, members: &[net::Member], status: &[(u32, u16, u8)], me: u32, host: u32, joinable: bool, hot: bool) {
+    let accent = if t == 0 { GOLD } else { BLUE };
+    let hs: Vec<&net::Member> = members.iter().filter(|m| m.team == t).collect();
+    let mine = hs.iter().any(|m| m.id == me);
+    p.rect_filled(r, 14.0, if hot { Color32::from_white_alpha(22) } else { CARD });
+    p.rect_stroke(r, 14.0, Stroke::new(if mine { 1.5 } else { 1.0 }, if mine { accent } else { Color32::from_white_alpha(24) }), StrokeKind::Inside);
+    // the head: team colour, name, 2/3
+    let count = format!("{}/{}", hs.len(), net::TEAM_MAX);
+    let cg = p.layout_no_wrap(count, bold(12.0), MUTED);
+    let hx = r.left() + 12.0;
+    let hy = r.top() + LOBBY_HEAD / 2.0 + 2.0;
+    p.circle_filled(pos2(hx + 4.0, hy), 4.0, accent);
+    let nw = r.width() - 34.0 - cg.size().x;
+    p.text(pos2(hx + 14.0, hy), Align2::LEFT_CENTER, fit(p, &name.to_uppercase(), bold(13.0), nw), bold(13.0), accent);
+    p.galley(pos2(r.right() - 10.0 - cg.size().x, hy - cg.size().y / 2.0), cg, MUTED);
+    // people with players: a short team shares the spares, see `owner_of`
+    let here: Vec<&&net::Member> = hs.iter().filter(|m| !m.away).collect();
+    for k in 0..3 {
+        let row = Rect::from_min_size(pos2(r.left() + 6.0, r.top() + LOBBY_HEAD + k as f32 * LOBBY_ROW), vec2(r.width() - 12.0, LOBBY_ROW - 4.0));
+        let c = pos2(row.left() + 17.0, row.center().y);
+        let tx = row.left() + 34.0;
+        if let Some(m) = hs.get(k) {
+            let you = m.id == me;
+            if you {
+                p.rect_filled(row, 10.0, Color32::from_rgba_unmultiplied(0xf2, 0xb6, 0x32, 22));
+            }
+            // their shirt, with their initial on it
+            p.circle_filled(c, 12.0, hex_col(save::SWATCHES[m.look[0] as usize % 8]));
+            p.circle_stroke(c, 12.0, Stroke::new(1.5, Color32::from_black_alpha(80)));
+            let ini: String = m.name.chars().next().map(|ch| ch.to_uppercase().collect()).unwrap_or_default();
+            p.text(c, Align2::CENTER_CENTER, ini, bold(12.0), Color32::WHITE);
+            // the connection, a dot on the shirt
+            let conn = status.iter().find(|s| s.0 == m.id).map_or(net::CONN_GOOD, |s| s.2);
+            let dot = if m.away || conn == net::CONN_AWAY { BAD } else if conn == net::CONN_SLOW { WARN } else { GOOD };
+            p.circle_filled(c + vec2(9.0, 9.0), 4.0, CARD);
+            p.circle_filled(c + vec2(9.0, 9.0), 2.8, dot);
+            let tw = row.right() - tx - 4.0;
+            let crown = if m.id == host { format!("{CROWN} ") } else { String::new() };
+            let nm = fit(p, &format!("{crown}{}", m.name), bold(14.0), tw);
+            p.text(pos2(tx, row.top() + 3.0), Align2::LEFT_TOP, nm, bold(14.0), if m.away { MUTED } else { Color32::WHITE });
+            let plays = if m.away { 0 } else { (0..3).filter(|i| here.get(i % here.len().max(1)).map_or(false, |x| x.id == m.id)).count() };
+            let mut sub = vec![format!("LV {}", m.look[6].max(1))];
+            if you {
+                sub.insert(0, "You".into());
+            }
+            if m.away {
+                sub = vec!["reconnecting…".into()];
+            } else if plays > 1 {
+                sub.push(format!("plays {plays}"));
+            }
+            let sc = if m.away { WARN } else if you { GOLD } else { MUTED };
+            p.text(pos2(tx, row.top() + 20.0), Align2::LEFT_TOP, fit(p, &sub.join(" · "), FontId::proportional(11.0), tw), FontId::proportional(11.0), sc);
+        } else {
+            // an empty spot
+            let stroke = Stroke::new(1.0, Color32::from_white_alpha(if joinable && hot { 70 } else { 28 }));
+            let pts = [row.left_top(), row.right_top(), row.right_bottom(), row.left_bottom(), row.left_top()];
+            for w in pts.windows(2) {
+                p.extend(egui::Shape::dashed_line(&[w[0], w[1]], stroke, 4.0, 4.0));
+            }
+            let (txt, col) = if hs.is_empty() && k == 0 {
+                ("Computer plays".to_string(), MUTED)
+            } else if joinable && k == hs.len() {
+                ("+ Tap to join".to_string(), if hot { Color32::WHITE } else { accent })
+            } else {
+                ("Open spot".to_string(), Color32::from_white_alpha(90))
+            };
+            p.text(row.center(), Align2::CENTER_CENTER, fit(p, &txt, FontId::proportional(12.0), row.width() - 8.0), FontId::proportional(12.0), col);
+        }
     }
 }
 
@@ -909,6 +1024,7 @@ fn hud(app: &mut FlunkiApp, ctx: &egui::Context, p: &egui::Painter, sr: Rect) {
             p.galley(r.min + vec2(12.0, 5.0), gal, Color32::WHITE);
         }
     }
+    nametags(app, p, sr);
     // speech bubbles over heads
     for b in &app.bubbles {
         let head = app.heads[b.t][b.i];
@@ -929,7 +1045,7 @@ fn hud(app: &mut FlunkiApp, ctx: &egui::Context, p: &egui::Painter, sr: Rect) {
         let a = (b.life / 0.35).min(1.0);
         let k = ((2.6 - b.life) / 0.15).min(1.0);
         let txt = voice::QM[b.msg % 9];
-        let gal = p.layout_no_wrap(txt.into(), FontId::proportional(15.0 * (0.8 + 0.2 * k)), fade(INK, a));
+        let gal = p.layout_no_wrap(txt.into(), FontId::proportional(15.0), fade(INK, a));
         let r = Rect::from_center_size(pos - vec2(0.0, 22.0 + gal.size().y / 2.0), gal.size() + vec2(20.0, 12.0));
         p.rect_filled(r, 12.0, fade(Color32::from_rgb(0xfd, 0xfa, 0xf0), a));
         p.add(egui::Shape::convex_polygon(vec![pos2(pos.x - 7.0, r.bottom() - 1.0), pos2(pos.x + 7.0, r.bottom() - 1.0), pos2(pos.x, r.bottom() + 9.0)], fade(Color32::from_rgb(0xfd, 0xfa, 0xf0), a), Stroke::NONE));
@@ -944,7 +1060,7 @@ fn hud(app: &mut FlunkiApp, ctx: &egui::Context, p: &egui::Painter, sr: Rect) {
         let drop = (1.0 - k) * (1.0 - k) * 18.0;
         let y = sr.top() + h * 0.27 - drop;
         let col = if b.straf { BAD } else { Color32::WHITE };
-        let ts = (w * 0.12).clamp(34.0, 64.0).round();
+        let ts = banner_size(w);
         shadow_text(p, pos2(sr.center().x, y), Align2::CENTER_CENTER, &b.title, anton(ts), fade(col, a));
         if !b.sub.is_empty() {
             let gal = p.layout_no_wrap(b.sub.clone(), FontId::proportional(16.0), fade(Color32::WHITE, a));
@@ -969,6 +1085,8 @@ fn hud(app: &mut FlunkiApp, ctx: &egui::Context, p: &egui::Painter, sr: Rect) {
         if !who.is_empty() {
             hint_pill(p, pos2(sr.center().x, sr.bottom() + HINT_Y), format!("{who} is aiming…"), false);
         }
+    } else if let Some(txt) = team_hint(app) {
+        hint_pill(p, pos2(sr.center().x, sr.bottom() + HINT_Y), txt, false);
     }
     if let Some((txt, _)) = &app.hint {
         let gal = p.layout_no_wrap(txt.clone(), FontId::proportional(15.0), Color32::WHITE);
@@ -998,6 +1116,82 @@ fn hud(app: &mut FlunkiApp, ctx: &egui::Context, p: &egui::Painter, sr: Rect) {
                 app.screen = Screen::Paused;
             }
         });
+    }
+}
+
+/// Online, with teammates: when it's their runner or their beer and not yours, say so instead of nothing.
+fn team_hint(app: &FlunkiApp) -> Option<String> {
+    let g = &app.game;
+    let n = app.net.as_ref().filter(|_| g.mode == Mode::Online && app.screen == Screen::Playing)?;
+    let t = g.my_team?;
+    let names = |is: &[usize]| {
+        let mut v: Vec<String> = Vec::new();
+        for &i in is {
+            if let Some(m) = n.owner(t, i).filter(|m| m.id != n.id) {
+                if !v.contains(&m.name) {
+                    v.push(m.name.clone());
+                }
+            }
+        }
+        v.join(" & ")
+    };
+    if g.state == State::Run && g.hitter == Some(1 - t) && g.run_phase_active() && !app.show_pads(t) {
+        let (_, a, b) = g.runners()?;
+        let who = names(&[Some(a), b].into_iter().flatten().collect::<Vec<_>>());
+        return (!who.is_empty()).then(|| format!("{who} {} · cheer them on!", if who.contains('&') { "run" } else { "runs" }));
+    }
+    if g.false_start_window(t) && !app.show_pads(t) {
+        let tm = &g.teams[t];
+        let who = names(&[Some(tm.runner_idx()), tm.runner2_idx()].into_iter().flatten().collect::<Vec<_>>());
+        return (!who.is_empty()).then(|| format!("If they hit, {who} {}", if who.contains('&') { "run" } else { "runs" }));
+    }
+    if g.can_drink(t) && !app.show_drink(t) {
+        return Some("Your beer is empty · your teammates drink on".into());
+    }
+    None
+}
+
+/// Online: a name over every player, so you can see who plays whom and which ones are yours. The name
+/// goes with its person: someone who drops out is covered by a teammate (their name) or the computer.
+fn nametags(app: &FlunkiApp, p: &egui::Painter, sr: Rect) {
+    let g = &app.game;
+    let Some(n) = app.net.as_ref().filter(|_| g.mode == Mode::Online && g.mirror && app.screen == Screen::Playing) else { return };
+    let fr = full_rect();
+    // where each head is on screen, first: a name is never wider than the room to its neighbours
+    let mut at: Vec<(usize, usize, Pos2)> = Vec::new();
+    for t in 0..2 {
+        for i in 0..3 {
+            let head = app.heads[t][i];
+            // your own thrower is right behind the camera while you aim
+            if !g.teams[t].players[i].visible || app.bubbles.iter().any(|b| b.t == t && b.i == i) || app.cam.pos.distance(head) < 1.6 {
+                continue;
+            }
+            if let Some(q) = app.cam.world_to_screen(head).map(|(x, y)| pos2(fr.left() + x * fr.width(), fr.top() + y * fr.height())).filter(|q| sr.contains(*q)) {
+                at.push((t, i, q));
+            }
+        }
+    }
+    for &(t, i, pos) in &at {
+        let room = at.iter().filter(|o| (o.0, o.1) != (t, i) && (o.2.y - pos.y).abs() < 22.0).map(|o| (o.2.x - pos.x).abs() - 6.0).fold(150.0f32, f32::min).max(30.0);
+        let accent = if t == 0 { GOLD } else { BLUE };
+        let mine = g.my_players[t][i];
+        let (txt, fill, col) = match n.owner(t, i) {
+            _ if mine => ("YOU".to_string(), GOLD, INK),
+            Some(m) => (m.name.clone(), PANEL, Color32::WHITE),
+            None => ("CPU".to_string(), Color32::from_black_alpha(150), MUTED),
+        };
+        // done: off the pitch, the name stays but steps back
+        let a = if g.teams[t].out[i] { 0.45 } else { 1.0 };
+        let pad = if mine { 14.0 } else { 20.0 };
+        let gal = p.layout_no_wrap(fit(p, &txt, bold(13.0), room - pad), bold(13.0), fade(col, a));
+        let r = Rect::from_center_size(pos - vec2(0.0, 14.0 + gal.size().y / 2.0), gal.size() + vec2(pad, 6.0));
+        p.rect_filled(r, r.height() / 2.0, fade(fill, a));
+        if !mine {
+            // the team's colour, as a dot in front of the name
+            p.circle_filled(r.left_center() + vec2(7.0, 0.0), 3.0, fade(accent, a));
+        }
+        p.add(egui::Shape::convex_polygon(vec![pos2(pos.x - 5.0, r.bottom() - 1.0), pos2(pos.x + 5.0, r.bottom() - 1.0), pos2(pos.x, r.bottom() + 5.0)], fade(fill, a), Stroke::NONE));
+        p.galley(r.min + vec2(if mine { 7.0 } else { 13.0 }, 3.0), gal, fade(col, a));
     }
 }
 
@@ -1059,7 +1253,7 @@ fn net_hud(app: &FlunkiApp, p: &egui::Painter, sr: Rect) {
         p.galley(pos2(box_r.center().x - tg.size().x / 2.0, box_r.top() + 8.0), tg, col);
         p.galley(pos2(box_r.center().x - sg.size().x / 2.0, box_r.top() + 46.0), sg, Color32::WHITE);
     } else if !sub.is_empty() {
-        let gal = p.layout_no_wrap(sub, FontId::proportional(12.5), col);
+        let gal = p.layout_no_wrap(sub, FontId::proportional(13.0), col);
         let r = Rect::from_center_size(pos2(sr.center().x, sr.top() + 126.0), gal.size() + vec2(18.0, 6.0));
         p.rect_filled(r, 8.0, PANEL);
         p.galley(r.min + vec2(9.0, 3.0), gal, col);
@@ -1078,7 +1272,8 @@ fn controls(app: &FlunkiApp, p: &egui::Painter, sr: Rect) {
     for c in app.controls(sr) {
         match c.kind {
             CtlKind::Drink(t) => {
-                let d = &g.teams[t].dc;
+                let Some(k) = app.lead(t) else { continue };
+                let d = &g.teams[t].dc[k];
                 let cen = c.rect.center();
                 let rad = c.rect.width() * 0.5;
                 let stop_now = !g.can_drink(t) && d.stop_show > 0.0;
@@ -1110,7 +1305,8 @@ fn controls(app: &FlunkiApp, p: &egui::Painter, sr: Rect) {
                 p.text(cen + vec2(0.0, 20.0), Align2::CENTER_CENTER, m2, FontId::proportional(12.0), if stop_now { Color32::WHITE } else { INK });
             }
             CtlKind::Pad(t, f) => {
-                let rc = &g.teams[t].rc;
+                let Some(k) = app.lead(t) else { continue };
+                let rc = &g.teams[t].rc[k];
                 let wait = g.false_start_window(t);
                 let next = !wait && ((f == Foot::L && rc.last != Some(Foot::L)) || (f == Foot::R && rc.last == Some(Foot::L)));
                 let down = rc.down[f as usize] > 0.0;
@@ -1168,7 +1364,7 @@ fn controls(app: &FlunkiApp, p: &egui::Painter, sr: Rect) {
 /// A button in a quick menu; a locked one says at what level it comes, and only tells you that when tapped.
 fn quick_btn(ui: &mut Ui, text: String, size: f32, need: Option<u32>, fill: Color32, col: Color32, min: egui::Vec2) -> egui::Response {
     let (text, fill, col, size) = match need {
-        Some(lv) => (format!("{}\n{LOCK} Level {lv}", text.rsplit('\n').next().unwrap_or("")), Color32::from_white_alpha(14), MUTED, 11.5),
+        Some(lv) => (format!("{}\n{LOCK} Level {lv}", text.rsplit('\n').next().unwrap_or("")), Color32::from_white_alpha(14), MUTED, 12.0),
         None => (text, fill, col, size),
     };
     ui.add(egui::Button::new(RichText::new(text).size(size).color(col)).fill(fill).corner_radius(CornerRadius::same(10)).min_size(min))
@@ -1220,7 +1416,7 @@ fn qm_panel(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
                     for col in 0..3 {
                         let i = row * 3 + col;
                         let need = quick_need(app, Unlock::Quick(i));
-                        if quick_btn(ui, voice::QM[i].to_string(), if (6..8).contains(&i) { 22.0 } else { 14.5 }, need, Color32::from_rgb(0xfd, 0xfa, 0xf0), INK, vec2(cw, 44.0)).clicked() {
+                        if quick_btn(ui, voice::QM[i].to_string(), if (6..8).contains(&i) { 22.0 } else { 15.0 }, need, Color32::from_rgb(0xfd, 0xfa, 0xf0), INK, vec2(cw, 44.0)).clicked() {
                             match need {
                                 Some(lv) => app.hint = Some((format!("{} unlocks at level {lv}", voice::QM[i]), 1.6)),
                                 None => app.send_qm(i),
@@ -1251,7 +1447,7 @@ fn coach(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect, t: Tut) {
         panel().show(ui, |ui| {
             ui.set_width(w - 32.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("TUTORIAL · STEP {} OF 5", t.step())).size(11.5).color(GOOD).font(bold(16.0)));
+                ui.label(RichText::new(format!("TUTORIAL · STEP {} OF 5", t.step())).size(12.0).color(GOOD).font(bold(16.0)));
                 if t != Tut::Done {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.add(egui::Button::new(RichText::new("Skip").size(13.0)).fill(Color32::TRANSPARENT)).clicked() {
@@ -1263,7 +1459,7 @@ fn coach(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect, t: Tut) {
                 }
             });
             ui.label(RichText::new(title).font(anton(24.0)).color(Color32::WHITE));
-            ui.label(RichText::new(text).color(MUTED).size(14.5));
+            ui.label(RichText::new(text).color(MUTED).size(15.0));
             match t {
                 Tut::Intro => {
                     if big(ui, "SHOW ME", true, w - 32.0).clicked() {
@@ -1509,7 +1705,7 @@ fn invite_prompt(app: &mut FlunkiApp, ctx: &egui::Context) {
     egui::Area::new(egui::Id::new("invite")).order(egui::Order::Tooltip).pivot(Align2::CENTER_TOP).fixed_pos(anc(Align2::CENTER_TOP, vec2(0.0, 84.0))).show(ctx, |ui| {
         panel().show(ui, |ui| {
             ui.label(RichText::new(format!("{name} invites you")).font(anton(22.0)).color(GOLD));
-            ui.label(RichText::new(format!("Match {room}")).color(MUTED).size(13.5));
+            ui.label(RichText::new(format!("Match {room}")).color(MUTED).size(14.0));
             ui.horizontal(|ui| {
                 if big(ui, "JOIN", true, 120.0).clicked() {
                     act = 1;
@@ -1557,7 +1753,7 @@ fn friends_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
         let so = &mut app.social;
         egui::ScrollArea::vertical().id_salt("friendlist").max_height(h - 52.0).auto_shrink([false, false]).show(ui, |ui| {
         if !so.err.is_empty() {
-            ui.label(RichText::new(so.err.clone()).color(BAD).size(13.5));
+            ui.label(RichText::new(so.err.clone()).color(BAD).size(14.0));
         }
         if !so.ready {
             ui.label(RichText::new(if so.stopped { "Friends aren't available: update the game" } else { "Connecting to the server…" }).color(MUTED));
@@ -1597,7 +1793,7 @@ fn friends_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
         if !so.friends.is_empty() {
             label_caps(ui, "Your friends");
         } else if so.ready && so.requests.is_empty() {
-            ui.label(RichText::new("No friends yet. Trade codes and add each other.").color(MUTED).size(13.5));
+            ui.label(RichText::new("No friends yet. Trade codes and add each other.").color(MUTED).size(14.0));
         }
         let mut list: Vec<_> = so.friends.iter().collect();
         list.sort_by_key(|f| (!f.online, f.name.to_lowercase()));
@@ -1610,7 +1806,7 @@ fn friends_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
                     ui.painter().circle_filled(r.center(), 5.0, col);
                     ui.vertical(|ui| {
                         ui.label(RichText::new(f.name.clone()).color(Color32::WHITE).size(16.0));
-                        ui.label(RichText::new(txt).color(MUTED).size(12.5));
+                        ui.label(RichText::new(txt).color(MUTED).size(13.0));
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let chat = if f.unread > 0 { format!("Chat ({})", f.unread) } else { "Chat".to_string() };
@@ -1620,7 +1816,8 @@ fn friends_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
                         if small_btn(ui, "Stats").clicked() {
                             act = Some(Act::Stats(f.code.clone()));
                         }
-                        if room.is_some() && f.online && f.status != crate::net::STATUS_MATCH && small_btn(ui, "Invite").clicked() {
+                        // offline friends get a notification on their phone
+                        if room.is_some() && f.status != crate::net::STATUS_MATCH && small_btn(ui, "Invite").clicked() {
                             act = Some(Act::Invite(f.code.clone()));
                         }
                     });
@@ -1651,8 +1848,9 @@ fn friends_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
         Some(Act::Stats(code)) => app.social.open_stats_for(&code),
         Some(Act::Invite(to)) => {
             let name = app.social.name_of(&to);
+            let online = app.social.friends.iter().any(|f| f.code == to && f.online);
             app.social.send(T::Invite { to, room: room.clone().unwrap_or_default() });
-            app.hint = Some((format!("Invited {name}"), 1.6));
+            app.hint = Some((if online { format!("Invited {name}") } else { format!("Invited {name}: they'll get a notification") }, 2.0));
         }
         Some(Act::Copy(code)) => {
             copy_text(ctx, &code);
@@ -1758,7 +1956,7 @@ fn chat_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect, code: &str) {
         egui::ScrollArea::vertical().id_salt("chatlog").max_height(log_h).min_scrolled_height(log_h).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
             ui.set_width(w);
             if msgs.is_empty() {
-                ui.label(RichText::new(format!("Nothing yet. Say hi to {name}. They'll get it even if they're offline.")).color(MUTED).size(13.5));
+                ui.label(RichText::new(format!("Nothing yet. Say hi to {name}. They'll get it even if they're offline.")).color(MUTED).size(14.0));
             }
             for m in &msgs {
                 let mine = m.from == me;
@@ -1766,7 +1964,7 @@ fn chat_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect, code: &str) {
                 ui.with_layout(layout, |ui| {
                     egui::Frame::NONE.fill(if mine { Color32::from_rgb(0x8a, 0x6a, 0x1a) } else { CARD }).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::symmetric(11, 7)).show(ui, |ui| {
                         ui.set_max_width(w * 0.75);
-                        ui.add(egui::Label::new(RichText::new(m.text.clone()).color(Color32::WHITE).size(15.5)).wrap());
+                        ui.add(egui::Label::new(RichText::new(m.text.clone()).color(Color32::WHITE).size(16.0)).wrap());
                     });
                 });
                 ui.add_space(3.0);
@@ -1853,7 +2051,7 @@ fn login_box(app: &mut FlunkiApp, ui: &mut Ui, w: f32, why: &str) {
     let r = text_field(ui, "loginpass", egui::TextEdit::singleline(&mut app.login_pass).password(true).hint_text("Password").char_limit(net::PASS_MAX).desired_width(w).margin(vec2(12.0, 10.0)).font(FontId::proportional(18.0)));
     let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
     if !app.social.auth_err.is_empty() {
-        ui.label(RichText::new(app.social.auth_err.clone()).color(BAD).size(13.5));
+        ui.label(RichText::new(app.social.auth_err.clone()).color(BAD).size(14.0));
     }
     let mut go = None;
     if busy {
@@ -1868,7 +2066,7 @@ fn login_box(app: &mut FlunkiApp, ui: &mut Ui, w: f32, why: &str) {
                 go = Some(true);
             }
         });
-        ui.label(RichText::new(format!("New here? Pick a username ({}–{} letters or digits; it's your player's name) and a password of at least {} characters, then Sign up.", net::USER_MIN, net::USER_MAX, net::PASS_MIN)).color(MUTED).size(12.5));
+        ui.label(RichText::new(format!("New here? Pick a username ({}–{} letters or digits; it's your player's name) and a password of at least {} characters, then Sign up.", net::USER_MIN, net::USER_MAX, net::PASS_MIN)).color(MUTED).size(13.0));
     }
     if let Some(new) = go {
         // say what's wrong before asking the server
@@ -1903,7 +2101,7 @@ fn account_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
         } else if !app.save.logged_in() {
             // optional here: the phone has a player of its own
             login_box(app, ui, w, "Sign up to keep this player, its friends and progress under a username and password, and play as them on the web too.");
-            ui.label(RichText::new("Logging in to another account switches to it; log out to get this phone's own player back.").color(MUTED).size(12.5));
+            ui.label(RichText::new("Logging in to another account switches to it; log out to get this phone's own player back.").color(MUTED).size(13.0));
         } else {
             ui.label(RichText::new(format!("{CHECK} Logged in as {}", app.save.user)).color(GOOD).size(16.0));
             close |= done_row(ui, w);
@@ -2073,7 +2271,7 @@ fn train_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
         if sheet_head(ui, "Training") {
             close = true;
         }
-        ui.label(RichText::new("Solo drills in the training hall. Fouls cost 2 seconds. Records go on the chalkboard.").color(MUTED).size(13.5));
+        ui.label(RichText::new("Solo drills in the training hall. Fouls cost 2 seconds. Records go on the chalkboard.").color(MUTED).size(14.0));
         for (k, sub) in [(Drill::Throw, "10 throws, count your hits"), (Drill::Drink, "One bottle, as fast as you can without choking"), (Drill::Run, "Three runs, fetch and back")] {
             let pb = app.save.train_pb[k.idx()];
             let line = format!("{sub} · record {}", k.fmt(pb));
@@ -2113,6 +2311,28 @@ fn settings_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
         dirty |= toggle(ui, &mut s.vibrate, "Vibrate on hits and fouls", w);
         dirty |= toggle(ui, &mut s.trail, "Ball trail", w);
         dirty |= toggle(ui, &mut s.voices, "Spoken quick messages", w);
+        // on the web it's on only once the browser allows it; switching it on asks
+        #[cfg(target_arch = "wasm32")]
+        {
+            let allowed = crate::app::web_notify_permission(false);
+            if allowed != "unsupported" {
+                let mut on = s.notify && allowed == "granted";
+                if toggle(ui, &mut on, "Notify me of invites and messages", w) {
+                    s.notify = on;
+                    dirty = true;
+                    if on {
+                        crate::app::web_notify_permission(true);
+                    }
+                }
+                if allowed == "denied" {
+                    ui.label(RichText::new("Notifications are blocked for this site in your browser's settings").color(MUTED).size(13.0));
+                }
+            }
+        }
+        #[cfg(target_os = "android")]
+        if toggle(ui, &mut s.notify, "Notify me of invites and messages", w) {
+            dirty = true;
+        }
         {
             label_caps(ui, "Account");
             if !app.save.logged_in() {
@@ -2131,6 +2351,12 @@ fn settings_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
                 });
             }
         }
+        label_caps(ui, "About");
+        ui.label(RichText::new(format!("FlunkieBal build {}", crate::net::APP_BUILD)).color(MUTED).size(14.0));
+        update_row(app, ui, w);
+        if big(ui, &format!("{BUG} REPORT A BUG"), false, w).clicked() {
+            app.sheet = Sheet::Bug;
+        }
         if dirty {
             app.save.store();
             app.audio.volume = app.save.settings.volume as f32 / 100.0;
@@ -2138,6 +2364,70 @@ fn settings_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
         close |= done_row(ui, w);
     });
     if close {
+        app.sheet = Sheet::None;
+    }
+}
+
+/// A newer version is out: say so, and get it from here.
+fn update_row(app: &mut FlunkiApp, ui: &mut Ui, w: f32) {
+    if !app.outdated() {
+        return;
+    }
+    #[cfg(target_os = "android")]
+    let state = crate::android::update_state();
+    #[cfg(not(target_os = "android"))]
+    let state = String::new();
+    egui::Frame::NONE.fill(Color32::from_rgb(0x3a, 0x2a, 0x0a)).corner_radius(CornerRadius::same(12)).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
+        ui.set_width(w - 20.0);
+        ui.label(RichText::new(format!("{DOWNLOAD} A new version is out")).font(bold(16.0)).color(GOLD));
+        let (line, can) = if let Some(p) = state.strip_prefix("get:") {
+            (format!("Downloading… {p}%"), false)
+        } else if state == "install" {
+            ("Follow the installer to finish".to_string(), true)
+        } else if let Some(e) = state.strip_prefix("err:") {
+            (format!("That didn't work: {e}"), true)
+        } else if cfg!(target_os = "android") {
+            ("Update to keep playing online with everyone".to_string(), true)
+        } else if cfg!(target_arch = "wasm32") {
+            ("Reload to get it".to_string(), true)
+        } else {
+            ("Pull and rebuild to get it".to_string(), false)
+        };
+        ui.label(RichText::new(line).color(Color32::WHITE).size(14.0));
+        if can && (cfg!(target_os = "android") || cfg!(target_arch = "wasm32")) && big(ui, if cfg!(target_arch = "wasm32") { "RELOAD" } else { "UPDATE NOW" }, true, w - 20.0).clicked() {
+            app.update_app();
+        }
+    });
+}
+
+/// Tell us what went wrong. The game adds what it knows about itself.
+fn bug_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
+    let mut close = false;
+    let mut send = false;
+    sheet(ctx, sr, "bug", sr.height() * 0.75, |ui, w| {
+        if sheet_head(ui, "Report a bug") {
+            close = true;
+        }
+        ui.label(RichText::new("What happened, and what were you doing? The FlunkCie gets it with your game's version and its last log lines; nothing else.").color(MUTED).size(14.0));
+        text_field(ui, "bug", egui::TextEdit::multiline(&mut app.bug_text).hint_text("The ball flew sideways when…").char_limit(crate::net::BUG_TEXT).desired_rows(5).desired_width(w));
+        let busy = app.social.bug_busy;
+        if let Some((ok, msg)) = &app.social.bug_res {
+            let (t, c) = if *ok { (format!("{CHECK} Sent, thank you!"), GOOD) } else { (msg.clone(), BAD) };
+            ui.label(RichText::new(t).color(c).size(14.0));
+        }
+        if big(ui, if busy { "SENDING…" } else { "SEND" }, true, w).clicked() && !busy && !app.bug_text.trim().is_empty() {
+            send = true;
+        }
+        close |= done_row(ui, w);
+    });
+    if send {
+        app.send_bug();
+    }
+    if app.social.bug_res.as_ref().map_or(false, |r| r.0) && !app.bug_text.is_empty() {
+        app.bug_text.clear();
+    }
+    if close {
+        app.social.bug_res = None;
         app.sheet = Sheet::None;
     }
 }
@@ -2151,14 +2441,14 @@ fn rules_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
         for (h, b) in [
             ("Throw", "Flick the ball up at the bottle in the middle. Throw while the moving ring is small for a bonus. Spin it in circles first for a curveball."),
             ("Hit it?", "When the bottle falls your team drinks. Hold DRINK, but let go before the gauge goes red or you choke and spill."),
-            ("Run", "The other team runs: tap L and R in turn. One fetches the ball, one stands the bottle up, then both go back behind their line."),
+            ("Run", "The other team runs: tap L and R in turn. One fetches the ball, one stands the bottle up, then both go back behind their line. Online, everyone taps for their own runner and holds DRINK for their own beer."),
             ("STOP", "When they are back, let go of your beer. Drinking after STOP is a foul."),
             ("The referee", "Fouls only count when the ref sees them. Watch the light on the grass: that is where he is looking. When he smokes, he sees nothing."),
-            ("Strafbier", "A foul he sees costs a full extra beer. Knocking over a bottle is always seen."),
+            ("Strafbier", "A foul he sees costs a full extra beer. Knock over a beer with your throw and it's always seen: a Strafbier for whoever's beer it was, so aim for theirs, never your own."),
             ("Sneak sip", "Drink any time with SNEAK SIP. It takes a while, and if the ref looks your way you get a Strafbier."),
             ("Winning", "Players who empty their bottle leave the pitch. The first team with nobody left wins."),
         ] {
-            ui.label(RichText::new(h).font(bold(16.0)).color(Color32::WHITE).size(16.5));
+            ui.label(RichText::new(h).font(bold(16.0)).color(Color32::WHITE).size(17.0));
             ui.label(RichText::new(b).color(MUTED));
         }
         close |= done_row(ui, w);
@@ -2269,7 +2559,7 @@ fn stats_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
         label_caps(ui, "By arena");
         egui::Grid::new("byarena").num_columns(4).spacing(vec2(14.0, 4.0)).show(ui, |ui| {
             for hd in ["Arena", "Played", "Won", "Hits"] {
-                ui.label(RichText::new(hd).color(MUTED).size(12.5));
+                ui.label(RichText::new(hd).color(MUTED).size(13.0));
             }
             ui.end_row();
             for k in PITCHES {
@@ -2334,3 +2624,44 @@ fn stats_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
 
 #[allow(dead_code)]
 fn _unused(_: Ctrl) {}
+
+#[cfg(test)]
+mod font_tests {
+    use super::*;
+    /// Laying out every size up front leaves the atlas big enough that the game's own text doesn't grow it.
+    #[test]
+    fn warm_fonts_fill_the_atlas_once() {
+        let ctx = egui::Context::default();
+        setup_style(&ctx);
+        ctx.all_styles_mut(|s| {
+            s.visuals.text_options.font_hinting = false;
+            s.visuals.text_options.subpixel_binning = false;
+        });
+        let mut input = egui::RawInput { max_texture_side: Some(4096), ..Default::default() };
+        input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(3.0);
+        let mut sizes = Vec::new();
+        for frame in 0..3 {
+            let t = std::time::Instant::now();
+            let out = ctx.run_ui(input.clone(), |ui| {
+                if frame == 1 {
+                    warm_fonts(ui.ctx(), 390.0);
+                }
+            });
+            for (_, ds) in &out.textures_delta.set {
+                for d in ds {
+                    sizes.push((frame, d.image.size(), d.pos.is_none()));
+                }
+            }
+            println!("frame {frame}: {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
+        println!("atlas uploads: {sizes:?}, fill {:.2}", ctx.fonts(|f| f.font_atlas_fill_ratio()));
+        // the HUD's text after that: nothing new for the atlas
+        let out = ctx.run_ui(input.clone(), |ui| {
+            let p = ui.painter();
+            p.text(pos2(10.0, 10.0), Align2::LEFT_TOP, "HIT!", anton(banner_size(390.0)), Color32::WHITE);
+            p.text(pos2(10.0, 90.0), Align2::LEFT_TOP, "Flick up to throw · spin in circles for a curveball", FontId::proportional(14.0), Color32::WHITE);
+            ui.label(RichText::new("Fouls only count when the ref sees them. Watch the light on the grass: that is where he is looking. When he smokes, he sees nothing.").color(MUTED));
+        });
+        assert!(out.textures_delta.set.iter().flat_map(|(_, ds)| ds.iter()).all(|d| d.pos.is_some()), "no whole-atlas upload after warming");
+    }
+}

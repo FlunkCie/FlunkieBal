@@ -89,9 +89,11 @@ mod web {
             let doc = web_sys::window().unwrap().document().unwrap();
             let canvas = doc.get_element_by_id("game").unwrap().dyn_into::<web_sys::HtmlCanvasElement>().unwrap();
             let mut opts = eframe::WebOptions::default();
-            // Firefox's WebGPU is still young; its WebGL is solid, and it is what the game is tested on
+            // WebGPU only where it's proven: Chromium (Chrome, Edge, Android). Firefox's is still young, and
+            // Safari's (every browser on an iPhone is Safari underneath, "CriOS" and the Google app too)
+            // flickers, loses the device and crawls at a few frames a second. Their WebGL is solid
             let ua = web_sys::window().and_then(|w| w.navigator().user_agent().ok()).unwrap_or_default();
-            if ua.contains("Firefox") {
+            if ua.contains("Firefox") || !ua.contains("Chrome/") {
                 if let egui_wgpu::WgpuSetup::CreateNew(c) = &mut opts.wgpu_options.wgpu_setup {
                     c.instance_descriptor.backends = egui_wgpu::wgpu::Backends::GL;
                 }

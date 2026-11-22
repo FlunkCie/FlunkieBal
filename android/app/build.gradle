@@ -2,6 +2,8 @@ plugins {
     id 'com.android.application'
 }
 
+def appBuild = (file("$rootDir/../core/src/proto.rs").text =~ /pub const APP_BUILD: u32 = (\d+);/)[0][1] as int
+
 android {
     namespace 'nl.flunkcie.flunkiebal'
     compileSdk 34
@@ -10,14 +12,17 @@ android {
         applicationId 'nl.flunkcie.flunkiebal'
         minSdk 26
         targetSdk 34
-        versionCode 9
-        versionName '0.9'
+        // the build number lives in core/src/proto.rs (APP_BUILD), which the server tells old games about
+        versionCode appBuild
+        versionName "0.${appBuild}"
     }
 
     buildTypes {
         release {
             minifyEnabled false
-            // sign with your own key: Build > Generate Signed App Bundle / APK in Android Studio
+            // signed with the debug key the downloadable APK has always had, so it installs over it;
+            // a release build isn't debuggable (no JDWP, no debug checks in the runtime)
+            signingConfig signingConfigs.debug
         }
     }
 

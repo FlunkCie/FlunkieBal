@@ -65,10 +65,12 @@ pub struct Settings {
     pub sens: f32,
     pub trail: bool,
     pub voices: bool,
+    /// notifications for invites and messages while the game isn't on screen
+    pub notify: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
-        Settings { volume: 80, vibrate: true, sens: 1.0, trail: true, voices: true }
+        Settings { volume: 80, vibrate: true, sens: 1.0, trail: true, voices: true, notify: true }
     }
 }
 
@@ -121,11 +123,23 @@ pub fn needs_login() -> bool {
 pub const SERVER: &str = "wss://flunkiebal.flunkcie.nl";
 
 /// Where online matches and friends are, always. `FLUNKI_SERVER` points the desktop build elsewhere,
-/// for trying out a server of your own.
+/// for trying out a server of your own; on a phone a debug build's `files/server` does (written with
+/// `adb shell run-as`, read once at startup).
 pub fn server() -> String {
     #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     if let Ok(s) = std::env::var("FLUNKI_SERVER") {
         return s;
+    }
+    #[cfg(target_os = "android")]
+    {
+        static OVERRIDE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let o = OVERRIDE.get_or_init(|| {
+            let s = std::fs::read_to_string(crate::android::data_dir()?.join("server")).ok()?;
+            Some(s.trim().to_string()).filter(|s| !s.is_empty())
+        });
+        if let Some(s) = o {
+            return s.clone();
+        }
     }
     SERVER.into()
 }

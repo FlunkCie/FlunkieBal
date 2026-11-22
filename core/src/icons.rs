@@ -6,6 +6,8 @@ pub const BEER: &str = "\u{eb62}";
 pub const BOOK: &str = "\u{e0e6}";
 pub const BOW: &str = "\u{e72e}";
 pub const BUZZBALL: &str = "\u{e31c}";
+pub const BUG: &str = "\u{e5f4}";
+pub const DOWNLOAD: &str = "\u{e20c}";
 pub const CHAT: &str = "\u{e16c}";
 pub const CHECK: &str = "\u{eba6}";
 pub const CIGARETTE: &str = "\u{ed90}";
@@ -35,3 +37,5 @@ pub const SOUND: &str = "\u{e44a}";
 pub const STATS: &str = "\u{e150}";
 pub const TRAINING: &str = "\u{e0b6}";
 pub const WAVE: &str = "\u{e580}";
+/// Every icon, for drawing them all once up front (see `ui::warm_fonts`).
+pub const ALL: &[&str] = &[ARROW_LEFT, ARROW_RIGHT, BACK, BEER, BOOK, BOW, BUZZBALL, BUG, DOWNLOAD, CHAT, CHECK, CIGARETTE, CLAP, COPY, CROWN, FIRE, SIGN_IN, SIGN_OUT, STAR, TARGET, TROPHY, TSHIRT, USER, DANCE, EMOTE, FACEPALM, FLEX, FRIENDS, GEAR, HOUSE, LAUGH, LOCK, LOCK_OPEN, MUTE, SOUND, STATS, TRAINING, WAVE];

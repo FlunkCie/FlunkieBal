@@ -43,8 +43,8 @@ pub(crate) enum Sheet {
     Friends,
     /// log in or sign up (the web version)
     Account,
-    /// you: level, numbers, and the way to everything about your player and account
-    Me,
+    /// tell us what went wrong
+    Bug,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PlayStep {
@@ -111,7 +111,7 @@ pub(crate) struct StatsCur {
 }
 
 /// The 3D render scales dynamic resolution goes between.
-const SCALE_STEPS: [f32; 5] = [0.55, 0.65, 0.75, 0.875, 1.0];
+const SCALE_STEPS: [f32; 6] = [0.45, 0.55, 0.65, 0.75, 0.875, 1.0];
 
 pub struct FlunkiApp {
     pub(crate) game: Game,
@@ -164,6 +164,8 @@ pub struct FlunkiApp {
     pub(crate) net: Option<Net>,
     pub(crate) social: crate::social::Social,
     pub(crate) net_err: String,
+    /// the connection is kept open all the time: when to try again after it went, and how often it has
+    net_retry: (f64, u32),
     pub(crate) code_in: String,
     pub(crate) name_edit: String,
     pub(crate) screen_rect: Rect,
@@ -182,6 +184,10 @@ pub struct FlunkiApp {
     /// dynamic resolution: how long it's been too slow and fast enough, and no step up before this
     scale_wait: (f32, f32),
     scale_up_after: f64,
+    /// test hook: no egui animations
+    no_anim: bool,
+    /// the pixel density and banner size the fonts were laid out for up front (`ui::warm_fonts`)
+    warmed: (f32, f32),
     /// a camera flight through the clubhouse door: (elapsed, from position, from look, into the hall?)
     pub(crate) fly: Option<(f32, Vec3, Vec3, bool)>,
     /// where we were last frame, to close menus when you move on
@@ -193,6 +199,12 @@ pub struct FlunkiApp {
     prog_sent: String,
     prog_t: f64,
     prog_synced: bool,
+    /// what the phone's background check was last told (server, code, secret, on), and when we last
+    /// looked for a tapped notification
+    notes_told: (String, String, String, bool),
+    open_t: f64,
+    /// the bug report being written
+    pub(crate) bug_text: String,
 }
 
 impl FlunkiApp {
@@ -272,6 +284,7 @@ impl FlunkiApp {
             net: None,
             social: Default::default(),
             net_err: String::new(),
+            net_retry: (0.0, 0),
             code_in: String::new(),
             screen_rect: Rect::from_min_size(Pos2::ZERO, vec2(400.0, 800.0)),
             safe: [0.0; 4],
@@ -285,6 +298,8 @@ impl FlunkiApp {
             scale_lock: false,
             scale_wait: (0.0, 0.0),
             scale_up_after: 0.0,
+            no_anim: false,
+            warmed: (0.0, 0.0),
             fly: None,
             last_nav: (Screen::Home, View::Menu, PlayStep::Choose, Sheet::None),
             login_user: String::new(),
@@ -292,6 +307,9 @@ impl FlunkiApp {
             prog_sent: String::new(),
             prog_t: 0.0,
             prog_synced: false,
+            notes_told: Default::default(),
+            open_t: 0.0,
+            bug_text: String::new(),
         };
         app.apply_volume();
         app
@@ -496,7 +514,9 @@ impl FlunkiApp {
             let p = g.teams[g.turn].players[g.teams[g.turn].idx].pos;
             return (vec3(p.x, 1.66 + (t * 1.5).sin() * 0.006, p.z + g.teams[g.turn].side * 0.05), vec3(0.0, 0.2, 0.0));
         }
-        if g.state == State::Flight && thrower_mine {
+        // once thrown, `idx` is the next thrower already: a teammate's, when people share a team
+        let threw_mine = g.thrown_by.map_or(false, |(t, i)| g.my_players[t][i]);
+        if g.state == State::Flight && threw_mine {
             let bx = g.ball.x;
             return (vec3(bx * 0.4, 2.3, g.teams[g.turn].side * (game::LINE + 1.6)), vec3(bx * 0.5, 0.3, 0.0));
         }
@@ -522,13 +542,28 @@ impl FlunkiApp {
             _ => g.my_team == Some(t),
         }
     }
+    /// The players on team `t` this screen works (all of them offline, your own online).
+    pub(crate) fn who(&self, t: usize) -> game::Who {
+        self.game.my_players[t]
+    }
+    /// The one of yours whose DRINK button and pads are shown.
+    pub(crate) fn lead(&self, t: usize) -> Option<usize> {
+        self.game.teams[t].lead(self.who(t))
+    }
     pub(crate) fn show_drink(&self, t: usize) -> bool {
         let g = &self.game;
-        self.mine_team(t) && ((g.can_drink(t) && g.teams[t].beers.iter().any(|b| *b > 0.0)) || g.teams[t].dc.stop_show > 0.0)
+        let who = self.who(t);
+        // your own beer: once it's empty, your teammates drink on without you
+        let beer = (0..3).any(|i| who[i] && g.teams[t].beers[i] > 0.0);
+        let stop = (0..3).any(|i| who[i] && g.teams[t].dc[i].stop_show > 0.0);
+        self.mine_team(t) && ((g.can_drink(t) && beer) || stop)
     }
     pub(crate) fn show_pads(&self, t: usize) -> bool {
         let g = &self.game;
-        self.mine_team(t) && !self.show_drink(t) && g.train.as_ref().map_or(true, |tr| tr.kind != Drill::Drink) && (g.can_run(t) || g.false_start_window(t) || (g.state == State::Run && g.hitter == Some(1 - t)))
+        let who = self.who(t);
+        // only the people whose players run get pads: before the hit the next two to throw, then the runners
+        let runs = if g.state == State::Run { g.running_of(t, who) != (false, false) } else { g.will_run(t, who) };
+        self.mine_team(t) && runs && !self.show_drink(t) && g.train.as_ref().map_or(true, |tr| tr.kind != Drill::Drink) && (g.can_run(t) || g.false_start_window(t) || (g.state == State::Run && g.hitter == Some(1 - t)))
     }
     pub(crate) fn qm_available(&self) -> bool {
         let g = &self.game;
@@ -586,43 +621,58 @@ impl FlunkiApp {
             let n = self.send_input(Input::Drink { hold, at: now_ms() });
             let g = &mut self.game;
             g.pred.hold_n = n;
-            let d = &mut g.teams[t].dc;
-            if !hold {
-                d.hold = false;
-            } else if g.state == State::Run && g.hitter == Some(t) && d.cough <= 0.0 && g.net_pause.is_none() {
-                d.hold = true;
-                d.ht = 0.0;
+            let can = g.state == State::Run && g.hitter == Some(t) && g.net_pause.is_none();
+            for i in 0..3 {
+                let beer = g.teams[t].beers[i] > 0.0;
+                let d = &mut g.teams[t].dc[i];
+                if !g.my_players[t][i] {
+                    continue;
+                }
+                if !hold {
+                    d.hold = false;
+                } else if can && beer && d.cough <= 0.0 {
+                    d.hold = true;
+                    d.ht = 0.0;
+                }
             }
             return;
         }
+        let who = self.who(t);
         if hold {
-            self.game.drink_press(t);
+            self.game.drink_press(t, who);
         } else {
-            self.game.drink_release(t);
+            self.game.drink_release(t, who);
         }
     }
     pub(crate) fn act_pad(&mut self, t: usize, f: Foot) {
         if self.game.mirror {
             let n = self.send_input(Input::Pad { foot: f as u8, at: now_ms() });
+            let who = self.who(t);
+            let Some(k) = self.lead(t) else { return };
             let g = &mut self.game;
-            let rc = &mut g.teams[t].rc;
-            rc.down[f as usize] = 0.08;
             g.pred.pad_n = n;
-            let run = g.state == State::Run && g.hitter == Some(1 - t) && g.net_run && g.net_pause.is_none();
-            let rc = &mut g.teams[t].rc;
-            if run && rc.lock <= 0.0 {
-                if rc.last == Some(f) {
-                    rc.msg = "Stumble! Alternate L and R".into();
-                    rc.msg_t = 0.9;
-                } else {
-                    g.pred.skip_step += 1;
-                    self.play(Sfx::Step);
+            let run = g.state == State::Run && g.hitter == Some(1 - t) && g.net_run && g.net_pause.is_none() && g.running_of(t, who) != (false, false);
+            let (lock, last) = (g.teams[t].rc[k].lock, g.teams[t].rc[k].last);
+            let stumble = last == Some(f);
+            for i in (0..3).filter(|&i| who[i]) {
+                let rc = &mut g.teams[t].rc[i];
+                rc.down[f as usize] = 0.08;
+                if run && lock <= 0.0 {
+                    if stumble {
+                        rc.msg = "Stumble! Alternate L and R".into();
+                        rc.msg_t = 0.9;
+                    }
+                    rc.last = Some(f);
                 }
-                self.game.teams[t].rc.last = Some(f);
+            }
+            if run && lock <= 0.0 && !stumble {
+                self.game.pred.skip_step += 1;
+                self.play(Sfx::Step);
             }
             return;
         }
-        self.game.pad_press(t, f);
+        let who = self.who(t);
+        self.game.pad_press(t, who, f);
     }
     pub(crate) fn act_sneak(&mut self) {
         if self.game.mirror {
@@ -912,28 +962,36 @@ impl FlunkiApp {
             self.hint = Some((format!("A teammate does: {}", crate::anim::EMOTES[i].0), 1.4));
         }
     }
-    /// Whose player does it: theirs, unless that one is busy. Every screen picks the same one.
+    /// A member's team and the players with their name over them (all three offline).
+    fn players_of(&self, id: u32) -> Option<(usize, game::Who)> {
+        let n = self.net.as_ref()?;
+        let m = n.members.iter().find(|m| m.id == id)?;
+        let t = m.team as usize;
+        Some((t, net::owned(&n.members, t, id)))
+    }
+    /// All of their own players do it (all three offline), each a beat after the last; busy ones sit it out.
     pub(crate) fn show_emote(&mut self, from: Option<u32>, i: usize) -> bool {
-        let (t, base) = match (self.game.mode, from, self.net.as_ref()) {
+        let (t, who) = match (self.game.mode, from, self.net.as_ref()) {
             (Mode::Online, Some(id), Some(n)) => {
-                let Some(m) = n.members.iter().find(|m| m.id == id) else { return false };
                 if self.qm_muted && id != n.id {
                     return false;
                 }
-                (m.team as usize, n.humans(m.team).iter().position(|x| x.id == id).unwrap_or(0))
+                let Some(tw) = self.players_of(id) else { return false };
+                tw
             }
-            _ => (self.game.my_team.unwrap_or(0), 0),
+            _ => (self.game.my_team.unwrap_or(0), game::ALL),
         };
         let g = &mut self.game;
         let aiming = matches!(g.state, State::Aim | State::CpuAim) && g.turn == t;
         let idx = g.teams[t].idx;
-        let free = (0..3).map(|k| (base + k) % 3).find(|p| !g.teams[t].out[*p] && !(aiming && idx == *p) && g.teams[t].players[*p].anim.mode == crate::game::AMode::Idle);
-        if let Some(p) = free {
+        let free: Vec<usize> = (0..3).filter(|p| who[*p] && !g.teams[t].out[*p] && !(aiming && idx == *p) && g.teams[t].players[*p].anim.mode == crate::game::AMode::Idle).collect();
+        for (n, &p) in free.iter().enumerate() {
             let a = &mut g.teams[t].players[p].anim;
             a.emote = i as u8 + 1;
-            a.emote_t = 0.0;
+            // a negative time is a wait: the pose only starts at 0
+            a.emote_t = -0.25 * n as f32;
         }
-        free.is_some()
+        !free.is_empty()
     }
     /// Show (and say) a quick message. `from` is a member id online; None means this player offline.
     pub(crate) fn show_qm(&mut self, from: Option<u32>, i: usize) {
@@ -943,8 +1001,11 @@ impl FlunkiApp {
                 if self.qm_muted && id != n.id {
                     return;
                 }
-                let k = n.humans(m.team).iter().position(|x| x.id == id).unwrap_or(0) % 3;
-                (m.team as usize, k, m.look[4] as usize)
+                let voice = m.look[4] as usize;
+                let Some((t, who)) = self.players_of(id) else { return };
+                // over their own player, the one still on the pitch if they can
+                let k = (0..3).find(|&i| who[i] && !self.game.teams[t].out[i]).or_else(|| (0..3).find(|&i| who[i])).unwrap_or(0);
+                (t, k, voice)
             }
             _ => (0, 0, self.save.profile.voice),
         };
@@ -1157,6 +1218,26 @@ impl FlunkiApp {
             }
         }
     }
+    /// The connection to the server is always there (once you may play online), so hosting, joining and
+    /// finding a match don't wait for one. When it goes it comes back by itself, sooner at first.
+    fn net_keep(&mut self) {
+        if self.save.locked() {
+            if let Some(n) = self.net.take() {
+                n.sock.close();
+            }
+            return;
+        }
+        if self.net.is_none() && self.time >= self.net_retry.0 {
+            let tries = self.net_retry.1;
+            self.net_retry = (self.time + (1.0 + tries as f64 * 2.0).min(15.0), tries + 1);
+            if let Ok(n) = Net::connect(&save::server(), self.time) {
+                self.net = Some(n);
+            }
+        }
+        if self.net.as_ref().map_or(false, |n| n.sock.state() == 1 && n.last_rx > n.opened) {
+            self.net_retry.1 = 0;
+        }
+    }
     /// Our friend code and secret, if we have them for this server.
     fn account_here(&self) -> (String, String) {
         let a = &self.save.account;
@@ -1193,11 +1274,18 @@ impl FlunkiApp {
         }
     }
     pub(crate) fn leave_online(&mut self) {
-        if let Some(mut n) = self.net.take() {
+        if let Some(n) = self.net.as_mut() {
             if n.in_room {
                 n.send(ToServer::Leave);
             }
-            n.sock.close();
+            // the connection stays, for the next match
+            n.leave_room();
+            if n.reconnect.is_some() {
+                // it was down while in the room: start afresh rather than resume a seat we just gave up
+                n.sock.close();
+                self.net = None;
+                self.net_retry.0 = 0.0;
+            }
         }
         self.game.mirror = false;
         self.game.net_pause = None;
@@ -1217,8 +1305,15 @@ impl FlunkiApp {
     /// The online match can't go on for us: back to the online screen, and say why.
     fn net_out(&mut self, msg: String) {
         let was_playing = matches!(self.screen, Screen::Playing | Screen::Paused | Screen::Over) && self.game.mode == Mode::Online;
-        if let Some(n) = self.net.take() {
-            n.sock.close();
+        if let Some(n) = self.net.as_mut() {
+            if n.reconnect.is_some() || n.sock.state() == 2 {
+                // a connection that's down starts afresh in the background
+                n.sock.close();
+                self.net = None;
+                self.net_retry.0 = 0.0;
+            } else {
+                n.leave_room();
+            }
         }
         self.game.mirror = false;
         self.game.net_pause = None;
@@ -1333,6 +1428,10 @@ impl FlunkiApp {
     /// Say yes to an invite: off to that room's lobby.
     pub(crate) fn accept_invite(&mut self) {
         let Some(i) = self.social.invite.take() else { return };
+        self.join_invited(&i.room);
+    }
+    /// Off to an invite's room, from wherever we are (a match too: a tapped notification).
+    fn join_invited(&mut self, room: &str) {
         self.leave_online();
         self.game.to_menu();
         self.game.bounds = None;
@@ -1340,11 +1439,129 @@ impl FlunkiApp {
         self.sheet = Sheet::None;
         self.screen = Screen::Play;
         self.step = PlayStep::Online;
-        self.net_join(&i.room);
+        self.net_join(room);
+    }
+
+    // ---------- notifications, updates, bug reports ----------
+    /// The server has a newer build than this one.
+    pub(crate) fn outdated(&self) -> bool {
+        self.social.latest > net::APP_BUILD
+    }
+    /// Get the newest version: on a phone the APK is downloaded and installed, in a browser the page is
+    /// loaded again (the server always has the newest).
+    pub(crate) fn update_app(&mut self) {
+        #[cfg(target_os = "android")]
+        crate::android::update(net::APK_URL);
+        #[cfg(target_arch = "wasm32")]
+        if let Some(w) = web_sys::window() {
+            let _ = w.location().reload();
+        }
+    }
+    /// Notifications: who the phone checks for in the background, what came in, and what was tapped.
+    fn notes_poll(&mut self) {
+        let notes = std::mem::take(&mut self.social.notes);
+        let on = self.save.settings.notify && !self.save.locked();
+        #[cfg(target_os = "android")]
+        {
+            let url = save::server();
+            let a = &self.save.account;
+            let told = if on && a.0 == url && !a.1.is_empty() { (net::http_url(&url), a.1.clone(), a.2.clone(), true) } else { Default::default() };
+            if told != self.notes_told {
+                if told.3 && !self.notes_told.3 {
+                    crate::android::ask_notify();
+                }
+                crate::android::notes_account(&told.0, &told.1, &told.2, told.3);
+                self.notes_told = told;
+            }
+            for n in &notes {
+                crate::android::notify(n);
+            }
+            if self.time - self.open_t > 0.5 {
+                self.open_t = self.time;
+                let open = crate::android::take_open();
+                if let Some(o) = &open {
+                    log_str(&format!("opened from a notification: {o}"));
+                }
+                match open {
+                    Some(o) if o.starts_with("room:") => {
+                        self.social.invite = None;
+                        self.join_invited(&o[5..]);
+                    }
+                    Some(o) if o == "update" => self.sheet = Sheet::Settings,
+                    Some(o) if o.starts_with("chat:") => {
+                        self.sheet = Sheet::Friends;
+                        if self.social.ready {
+                            self.social.open(&o[5..]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        if on {
+            for n in &notes {
+                web_notify(n);
+            }
+        }
+        #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
+        let _ = (notes, on);
+    }
+    /// What goes with a bug report besides what the player wrote.
+    pub(crate) fn bug_info(&self) -> String {
+        let g = &self.game;
+        let platform = if cfg!(target_os = "android") {
+            "android"
+        } else if cfg!(target_arch = "wasm32") {
+            "web"
+        } else {
+            "desktop"
+        };
+        #[cfg(target_arch = "wasm32")]
+        let agent = web_sys::window().and_then(|w| w.navigator().user_agent().ok()).unwrap_or_default();
+        #[cfg(not(target_arch = "wasm32"))]
+        let agent = String::new();
+        let online = self.net.as_ref().map_or("no connection".to_string(), |n| format!("socket={} room={} phase={} rtt={:.0}ms reconnecting={}", n.sock.state(), if n.in_room { n.code.as_str() } else { "-" }, n.phase, n.rtt * 1000.0, n.reconnect.is_some()));
+        let mut s = format!(
+            "build {} ({}), protocol {}, newest {}\n{agent}\nscreen={:?} sheet={:?} mode={:?} state={:?} turn={} mirror={} arena={:?}\n{online}\nfps={:.0} scale={:.2} logged_in={} friends_ready={}\n--- log ---\n",
+            net::APP_BUILD,
+            platform,
+            net::PROTOCOL,
+            self.social.latest,
+            self.screen,
+            self.sheet,
+            g.mode,
+            g.state,
+            g.turn,
+            g.mirror,
+            self.match_arena,
+            1.0 / self.fps_dt.max(1e-3),
+            self.render_scale,
+            self.save.logged_in(),
+            self.social.ready
+        );
+        for l in recent_log() {
+            s.push_str(&l);
+            s.push('\n');
+        }
+        let max = net::BUG_INFO;
+        if s.chars().count() > max {
+            // the newest lines matter most
+            s = s.chars().rev().take(max).collect::<Vec<_>>().into_iter().rev().collect();
+        }
+        s
+    }
+    pub(crate) fn send_bug(&mut self) {
+        let text: String = self.bug_text.trim().chars().take(net::BUG_TEXT).collect();
+        let info = self.bug_info();
+        if !self.social.send_bug(self.time, text, info) {
+            self.social.bug_res = Some((false, "Can't reach the server right now, try again in a moment".into()));
+        }
     }
     fn net_poll(&mut self) {
         // offline nobody reads these
         self.game.net_ev.clear();
+        self.net_keep();
         let now = self.time;
         let Some(n) = self.net.as_mut() else { return };
         if !n.try_reconnect(now) {
@@ -1369,6 +1586,9 @@ impl FlunkiApp {
             };
             if let FromServer::Pong { c } = m {
                 let Some(n) = self.net.as_mut() else { return };
+                if c == 0.0 {
+                    continue; // the socket's own keepalive
+                }
                 let r = ((at - c) / 1000.0).max(0.0) as f32;
                 n.rtt = if n.rtt == 0.0 { r } else { n.rtt * 0.7 + r * 0.3 };
                 self.game.pred.rtt = n.rtt.min(0.5);
@@ -1390,7 +1610,9 @@ impl FlunkiApp {
                 n.sock.close();
                 n.reconnect = Some(net::Reconnect { since: now, next: now, tries: 0, started: now });
             } else {
-                self.net_out("Couldn't reach the server. Check your connection and try again.".into());
+                // not in a match: nothing to tell, it just comes back in the background
+                n.sock.close();
+                self.net = None;
                 return;
             }
         }
@@ -1491,6 +1713,7 @@ impl FlunkiApp {
             }
             FromServer::Closed { why } => self.net_out(why),
             FromServer::Pong { .. } => {}
+            FromServer::Latest { build } => self.social.latest = build,
             FromServer::Emote { i, from } => {
                 if (i as usize) < crate::anim::EMOTES.len() {
                     self.show_emote(Some(from), i as usize);
@@ -1585,18 +1808,23 @@ impl FlunkiApp {
 
 impl eframe::App for FlunkiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let t_start = now_ms();
         // how long the first frames take: nothing reads the phone's input queue meanwhile
         if self.frames < 4 {
             self.frames += 1;
             log_str(&format!("startup: frame {} begins at {:.0} ms", self.frames, now_ms() - self.t0));
         }
         let ctx = ui.ctx().clone();
+        if self.no_anim {
+            ctx.all_styles_mut(|s| s.animation_time = 0.0);
+        }
         let full = ctx.content_rect();
         self.time = ctx.input(|i| i.time);
         if self.time - self.safe_t > 0.5 {
             self.safe_t = self.time;
             self.safe = safe_insets();
         }
+        let t_insets = now_ms();
         // everything you read or tap stays inside the safe area; the 3D picture fills the screen
         let sr = Rect::from_min_max(full.min + vec2(self.safe[3], self.safe[0]), full.max - vec2(self.safe[1], self.safe[2]));
         self.screen_rect = sr;
@@ -1604,9 +1832,34 @@ impl eframe::App for FlunkiApp {
         let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.05);
         self.fps_dt = self.fps_dt * 0.9 + ctx.input(|i| i.unstable_dt) * 0.1;
         self.time = ctx.input(|i| i.time);
+        // every font size once, before anyone opens a page (and again after turning the phone)
+        let warm = (ctx.pixels_per_point(), crate::ui::banner_size(sr.width()));
+        if self.frames >= 2 && warm != self.warmed {
+            // one bitmap per glyph instead of four (sub-pixel positions), and no hinting on a sharp
+            // screen: a quarter of the work, and what's laid out here is then all there is to draw.
+            // A change only counts from the next frame (it clears the atlas), so lay out after that
+            let hint = ctx.pixels_per_point() < 1.75;
+            let to = ctx.global_style().visuals.text_options;
+            if to.font_hinting != hint || to.subpixel_binning {
+                ctx.all_styles_mut(|s| {
+                    s.visuals.text_options.font_hinting = hint;
+                    s.visuals.text_options.subpixel_binning = false;
+                });
+            } else {
+                let t = now_ms();
+                crate::ui::warm_fonts(&ctx, sr.width());
+                self.warmed = warm;
+                log_str(&format!("fonts laid out in {:.0} ms", now_ms() - t));
+            }
+        }
+        let t_warm = now_ms();
         self.handle_input(&ctx, sr);
+        let t_input = now_ms();
         self.net_poll();
+        let t_net = now_ms();
         self.social_poll();
+        self.notes_poll();
+        let t_in = now_ms();
 
         // simulate (an online match keeps going while you look at the pause menu)
         // a drill waits until you have walked through the door
@@ -1779,7 +2032,10 @@ impl eframe::App for FlunkiApp {
             self.ring_r = 1.0 - ((self.game.clock * 0.7) % 1.0) * 0.75;
             let rest = pos2(sr.center().x, sr.bottom() - (140.0f32).min(h * 0.18));
             let target = self.flick.as_ref().map_or(rest, |f| f.cur);
-            let world = self.cam.screen_to_world((target.x - full.left()) / w, (target.y - full.top()) / h, 1.5);
+            // from where the camera is going, not where it is on its way: a quick flick while it
+            // still glides over from the last view would throw from the wrong spot (or be turned down)
+            let at = Cam { pos: tp, look: tl, ..self.cam };
+            let world = at.screen_to_world((target.x - full.left()) / w, (target.y - full.top()) / h, 1.5);
             if self.flick.is_some() || self.aim_ball.distance(world) > 3.0 {
                 self.aim_ball = world;
             } else {
@@ -1855,11 +2111,34 @@ impl eframe::App for FlunkiApp {
                 self.scale_wait = (0.0, 0.0);
             }
         }
+        let t_scene = now_ms();
         let fd = Arc::new(FrameData { globals: self.globals(lk), list: list.clone(), clear: lk.clear, scale: self.render_scale });
         self.frame_list = list;
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(full, SceneCallback(fd)));
         let painter = ui.painter().clone();
         crate::ui::draw(self, &ctx, &painter, sr, full);
+        let t_ui = now_ms();
+        // a hitch, in words: which part of this frame took the time, or how long since the last one
+        // (that gap is the GPU, texture uploads, the browser). Shows in the console and in logcat
+        let gap = ctx.input(|i| i.unstable_dt) * 1000.0;
+        if (t_ui - t_start > slow_ms() || gap > 80.0) && self.frames >= 4 {
+            log_str(&format!(
+                "slow frame: {:.0} ms here (input+net {:.0} = insets {:.0} fonts {:.0} input {:.0} net {:.0} friends {:.0}, match+scene {:.0}, ui {:.0}), {:.0} ms since the last; {:?} {:?} {:?}",
+                t_ui - t_start,
+                t_in - t_start,
+                t_insets - t_start,
+                t_warm - t_insets,
+                t_input - t_warm,
+                t_net - t_input,
+                t_in - t_net,
+                t_scene - t_in,
+                t_ui - t_scene,
+                gap,
+                self.screen,
+                self.sheet,
+                self.game.state
+            ));
+        }
         // moving to another screen closes whatever was open on the old one
         let (ls, lv, lp, lsh) = self.last_nav;
         if (self.screen, self.view) != (ls, lv) || (self.screen == Screen::Play && self.step != lp) {
@@ -1886,8 +2165,14 @@ impl eframe::App for FlunkiApp {
     }
 }
 
+/// The headline sizes there are. Every size is a row of glyphs in egui's atlas, and a full atlas is
+/// thrown away and drawn again (a hitch), so the big font comes in these sizes only.
+pub(crate) const ANTON_SIZES: [f32; 10] = [12.0, 14.0, 17.0, 20.0, 24.0, 28.0, 34.0, 44.0, 56.0, 64.0];
+pub(crate) fn anton_size(size: f32) -> f32 {
+    ANTON_SIZES.iter().copied().min_by(|a, b| (a - size).abs().total_cmp(&(b - size).abs())).unwrap_or(size)
+}
 pub(crate) fn anton(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name("anton".into()))
+    FontId::new(anton_size(size), FontFamily::Name("anton".into()))
 }
 pub(crate) fn fade(c: Color32, a: f32) -> Color32 {
     c.gamma_multiply(a.clamp(0.0, 1.0))
@@ -1949,7 +2234,7 @@ impl FlunkiApp {
                         "rules" => Sheet::Rules,
                         "friends" => Sheet::Friends,
                         "account" => Sheet::Account,
-                        "me" => Sheet::Me,
+                        "bug" => Sheet::Bug,
                         _ => Sheet::None,
                     }
                 }
@@ -1981,6 +2266,8 @@ impl FlunkiApp {
                     self.social.log_in(u, p, &name, cmd == "signup");
                 }
                 "logout" => self.log_out(),
+                // test hook: no fading in, for screenshots from a headless browser (few frames)
+                "noanim" => self.no_anim = true,
                 "netdrop" => {
                     // test hook: the connection breaks, the way a tunnel breaks it
                     if let Some(n) = self.net.as_ref() {
@@ -2114,17 +2401,82 @@ impl FlunkiApp {
         }
     }
 }
+/// The last lines logged, for a bug report.
+static RECENT: std::sync::Mutex<std::collections::VecDeque<String>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+const RECENT_LINES: usize = 40;
+fn keep_line(s: &str) {
+    if let Ok(mut r) = RECENT.lock() {
+        if r.len() >= RECENT_LINES {
+            r.pop_front();
+        }
+        r.push_back(format!("{:.1} {}", now_ms() / 1000.0 % 100000.0, s.chars().take(300).collect::<String>()));
+    }
+}
+pub(crate) fn recent_log() -> Vec<String> {
+    RECENT.lock().map(|r| r.iter().cloned().collect()).unwrap_or_default()
+}
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn log_str(s: &str) {
+    keep_line(s);
     web_sys::console::log_1(&s.into());
 }
 #[cfg(target_os = "android")]
 pub(crate) fn log_str(s: &str) {
+    keep_line(s);
     log::info!("{s}");
 }
 #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub(crate) fn log_str(s: &str) {
+    keep_line(s);
     println!("{s}");
+}
+/// A browser notification, while the tab isn't being looked at. Notification may not exist at all
+/// (an iPhone outside a home-screen app): everything goes through `Reflect`.
+#[cfg(target_arch = "wasm32")]
+fn web_notify(n: &net::Note) {
+    use js_sys::Reflect;
+    use wasm_bindgen::JsCast;
+    let Some(w) = web_sys::window() else { return };
+    if !w.document().map_or(false, |d| d.hidden()) {
+        return;
+    }
+    let Some(cls) = Reflect::get(&w, &"Notification".into()).ok().and_then(|c| c.dyn_into::<js_sys::Function>().ok()) else { return };
+    if Reflect::get(&cls, &"permission".into()).ok().and_then(|p| p.as_string()).as_deref() != Some("granted") {
+        return;
+    }
+    let (title, body) = note_words(n);
+    let opts = js_sys::Object::new();
+    let _ = Reflect::set(&opts, &"body".into(), &body.into());
+    let _ = Reflect::set(&opts, &"tag".into(), &format!("flunkiebal-{}", n.id).into());
+    let args = js_sys::Array::of2(&title.into(), &opts);
+    if let Ok(o) = Reflect::construct(&cls, &args) {
+        // tapping it brings the game's tab to the front
+        let f = js_sys::Function::new_no_args("window.focus(); this.close();");
+        let _ = Reflect::set(&o, &"onclick".into(), &f);
+    }
+}
+/// Ask the browser for notifications. Called from a tap, which browsers want for this.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn web_notify_permission(ask: bool) -> String {
+    use js_sys::Reflect;
+    use wasm_bindgen::JsCast;
+    let Some(w) = web_sys::window() else { return "unsupported".into() };
+    let Some(cls) = Reflect::get(&w, &"Notification".into()).ok().and_then(|c| c.dyn_into::<js_sys::Function>().ok()) else { return "unsupported".into() };
+    let now = Reflect::get(&cls, &"permission".into()).ok().and_then(|p| p.as_string()).unwrap_or_default();
+    if ask && now == "default" {
+        if let Ok(f) = Reflect::get(&cls, &"requestPermission".into()).and_then(|f| f.dyn_into::<js_sys::Function>().map_err(Into::into)) {
+            let _ = f.call0(&cls);
+        }
+    }
+    now
+}
+/// A notification in words: (title, text).
+pub(crate) fn note_words(n: &net::Note) -> (String, String) {
+    if n.kind == net::NOTE_INVITE {
+        (format!("{} invites you", n.name), format!("Come play FlunkieBal: match {}", n.room))
+    } else {
+        (n.name.clone(), n.text.clone())
+    }
 }
 /// Safe-area insets from the page (CSS env()) and, in the Android app, from the display cutout.
 #[cfg(target_arch = "wasm32")]
@@ -2154,5 +2506,14 @@ pub(crate) fn now_ms() -> f64 {
 }
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn now_ms() -> f64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as f64).unwrap_or(0.0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1000.0).unwrap_or(0.0)
+}
+
+/// A frame slower than this is logged (`FLUNKI_SLOW_MS` on the desktop, for looking closer).
+fn slow_ms() -> f64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(v) = std::env::var("FLUNKI_SLOW_MS").ok().and_then(|v| v.parse().ok()) {
+        return v;
+    }
+    40.0
 }

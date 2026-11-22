@@ -2,12 +2,17 @@
 //! screen is a mirror that draws ~20 full snapshots a second, moves things smoothly in between and
 //! predicts its own taps and throws until the server has acknowledged them.
 
-use crate::game::{AMode, Ev, Foot, Game, Mode, Sfx, State, StatEv, ThrowSpec, BR, G, KD, CURVE_A};
+use crate::game::{AMode, Ev, Foot, Game, Mode, Sfx, State, StatEv, ThrowSpec, Who, BR, G, KD, CURVE_A};
 use glam::{vec3, Vec3};
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the messages change; a mismatch is told to the player instead of misbehaving.
-pub const PROTOCOL: u32 = 9;
+pub const PROTOCOL: u32 = 11;
+/// This build of the game. Bumped with every release (the APK's versionCode is read from here, see
+/// `android/app/build.gradle`); the server says which is the latest (`Latest`), so an old app can tell.
+pub const APP_BUILD: u32 = 10;
+/// Where the newest APK is.
+pub const APK_URL: &str = "https://flunkcie.nl/downloads/flunkiebal.apk";
 pub const SNAP_HZ: f32 = 20.0;
 pub const MAX_PEOPLE: usize = 6;
 pub const ARENAS: [&str; 6] = ["vondel", "evening", "roof", "cafe", "club", "krakau"];
@@ -80,6 +85,9 @@ pub enum ToServer {
     Invite { to: String, room: String },
     /// What you two have played, the server keeps count.
     FriendStats { with: String },
+    /// A bug report, from anyone, logged in or not: what they wrote, and what the game adds about itself
+    /// (build, platform, screen, its last log lines). The answer is `BugSaved`.
+    Bug { v: u32, text: String, info: String },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -111,6 +119,10 @@ pub enum FromServer {
     Pong { c: f64 },
     Err { msg: String, fatal: bool },
     Closed { why: String },
+    /// The first thing on every connection: the newest build of the game (`APP_BUILD`) there is.
+    Latest { build: u32 },
+    /// A bug report was kept (`ok`), or why not.
+    BugSaved { ok: bool, msg: String },
     // ---------- friends ----------
     /// `user`: the username, for an account with a password (filed in lower case; `name` is it as typed,
     /// and that account's name for good).
@@ -129,9 +141,62 @@ pub enum FromServer {
     Said { with: String, m: ChatMsg },
     History { with: String, msgs: Vec<ChatMsg> },
     Invited { code: String, name: String, room: String },
+    /// Something to tell you about while you're not looking (an invite, a message), kept for the
+    /// phone's background check too (`NotesReq`).
+    Note { note: Note },
     FriendStats { with: String, s: PairStats },
     /// Not fatal, for the friends screen.
     SocialErr { msg: String },
+}
+
+/// A notification for someone. `id` counts up per account, so a phone shows each one once.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Note {
+    pub id: u64,
+    /// `NOTE_*`
+    pub kind: u8,
+    /// who it's from: friend code and name
+    pub from: String,
+    pub name: String,
+    /// the message, for `NOTE_MSG`
+    pub text: String,
+    /// the room, for `NOTE_INVITE`
+    pub room: String,
+    /// unix seconds
+    pub at: u64,
+}
+pub const NOTE_INVITE: u8 = 0;
+pub const NOTE_MSG: u8 = 1;
+/// How long an invite stays good (an invite to someone who's offline is only seen later).
+pub const INVITE_KEEP: u64 = 30 * 60;
+/// The phone's background check, a plain HTTP POST to `NOTES_PATH` (the game's sockets are closed then):
+/// the notes newer than `after`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct NotesReq {
+    pub code: String,
+    pub secret: String,
+    pub after: u64,
+}
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct NotesResp {
+    pub notes: Vec<Note>,
+    /// the newest build there is, as in `Latest`
+    pub build: u32,
+}
+pub const NOTES_PATH: &str = "/api/notes";
+/// The longest bug report: what the player wrote, and what the game adds (they share one message).
+pub const BUG_TEXT: usize = 1000;
+pub const BUG_INFO: usize = 5000;
+/// The server's address for plain HTTP: the same place as its websocket.
+pub fn http_url(ws: &str) -> String {
+    let ws = ws.trim().trim_end_matches('/');
+    if let Some(r) = ws.strip_prefix("wss://") {
+        format!("https://{r}")
+    } else if let Some(r) = ws.strip_prefix("ws://") {
+        format!("http://{r}")
+    } else {
+        ws.to_string()
+    }
 }
 
 pub const STATUS_FREE: u8 = 0;
@@ -234,6 +299,7 @@ pub fn team_of(ms: &[Member], t: u8) -> Vec<&Member> {
 }
 /// Who plays player `i` of team `t`: person k plays player k; a short team shares the spares, and
 /// someone who dropped out is covered by whoever is still there. Nobody there: the computer.
+/// A team has three players, so it takes three people at most (see `TEAM_MAX`).
 pub fn owner_of(ms: &[Member], t: usize, i: usize) -> Option<&Member> {
     let hs: Vec<&Member> = ms.iter().filter(|m| m.team as usize == t && !m.away).collect();
     if hs.is_empty() {
@@ -242,6 +308,11 @@ pub fn owner_of(ms: &[Member], t: usize, i: usize) -> Option<&Member> {
         Some(hs[i % hs.len()])
     }
 }
+/// The players person `id` works on team `t`: their DRINK button and run pads are theirs alone.
+pub fn owned(ms: &[Member], t: usize, id: u32) -> Who {
+    [0, 1, 2].map(|i| owner_of(ms, t, i).map_or(false, |m| m.id == id))
+}
+pub const TEAM_MAX: usize = 3;
 /// Set a game's sides from the roster. `me` is None on the server, which is on nobody's side.
 pub fn set_sides(g: &mut Game, ms: &[Member], me: Option<u32>) {
     g.mode = Mode::Online;
@@ -280,17 +351,19 @@ pub struct Snap {
     pub bc: f32,
     pub bo: [f32; 3], // bottle: theta, tip x, tip z
     pub gz: [f32; 4],
-    pub dc: [[f32; 6]; 2], // drink: gauge, cough, stop_show, hold, hold time, breath rate
-    pub rc: [[f32; 3]; 2], // run pads: last foot, lock, early
+    pub dc: Vec<[f32; 6]>, // each player's drink: gauge, cough, stop_show, hold, hold time, breath rate
+    pub rc: Vec<[f32; 3]>, // each player's run pads: last foot, lock, early
     pub kn: Vec<[f32; 5]>,
-    pub sn: [f32; 2],
+    pub sn: [f32; 6], // each player's sneaky sip
     pub rp: bool, // runners still out
+    pub rr: [i8; 2], // who runs: first and second runner (below 0: nobody)
     pub status: String,
     pub pz: f32, // match paused: seconds until it goes on anyway (below 0: not paused)
     pub pw: u32, // …waiting for this person
     pub al: f32, // seconds until an idle thrower's ball is thrown for them (below 0: no clock)
     pub rb: i8,  // the Strafbier on its way: team * 3 + player (below 0: none)
     pub rh: bool, // …in the referee's hand
+    pub tb: i8,   // who threw the ball in the air: team * 3 + player (below 0: nobody)
     pub dg: u32, // digest of the state, see `Game::digest`
     pub ev: Vec<(u32, Ev)>,
     pub sx: Vec<(u32, Sfx)>,
@@ -446,18 +519,23 @@ impl Game {
                 ou[t * 3 + i] = self.teams[t].out[i];
             }
         }
-        let dc = [0, 1].map(|t| {
-            let d = &self.teams[t].dc;
-            [q(d.p), q(d.cough), q(d.stop_show), d.hold as u8 as f32, q(d.ht), q(d.mul)]
-        });
-        let rc = [0, 1].map(|t| {
-            let r = &self.teams[t].rc;
-            [match r.last {
-                None => 0.0,
-                Some(Foot::L) => 1.0,
-                Some(Foot::R) => 2.0,
-            }, q(r.lock), self.teams[t].early]
-        });
+        let mut dc = Vec::with_capacity(6);
+        let mut rc = Vec::with_capacity(6);
+        let mut sn = [-1.0; 6];
+        for t in 0..2 {
+            for i in 0..3 {
+                let d = &self.teams[t].dc[i];
+                dc.push([q(d.p), q(d.cough), q(d.stop_show), d.hold as u8 as f32, q(d.ht), q(d.mul)]);
+                let r = &self.teams[t].rc[i];
+                let last = match r.last {
+                    None => 0.0,
+                    Some(Foot::L) => 1.0,
+                    Some(Foot::R) => 2.0,
+                };
+                rc.push([last, q(r.lock), self.teams[t].early[i]]);
+                sn[t * 3 + i] = self.sneak_progress_of(t, i).map_or(-1.0, q);
+            }
+        }
         Snap {
             m,
             q: seq,
@@ -482,14 +560,16 @@ impl Game {
             dc,
             rc,
             kn: self.knocked.iter().map(|((t, i, k), d)| [*t as f32, *i as f32, *k as f32, d[0], d[1]]).collect(),
-            sn: [0, 1].map(|t| self.sneak_progress_team(t).map_or(-1.0, q)),
+            sn,
             rp: self.run_phase_active(),
+            rr: self.runners().map_or([-1; 2], |(_, a, b)| [a as i8, b.map_or(-1, |b| b as i8)]),
             status: self.status_text_for(None),
             pz: -1.0,
             pw: 0,
             al: -1.0,
             rb: self.ref_bottle.map_or(-1, |(t, i)| (t * 3 + i) as i8),
             rh: self.ref_hold,
+            tb: self.thrown_by.map_or(-1, |(t, i)| (t * 3 + i) as i8),
             dg: self.digest(),
             ev: log.ev.clone(),
             sx: log.sx.clone(),
@@ -539,7 +619,7 @@ impl Game {
         let padding = ack < self.pred.pad_n;
         let throwing = ack < self.pred.throw_n && self.pred.throw_age < 2.0;
         let kept_dc: [_; 2] = [self.teams[0].dc.clone(), self.teams[1].dc.clone()];
-        let kept_last = [self.teams[0].rc.last, self.teams[1].rc.last];
+        let kept_last = [0, 1].map(|t| self.teams[t].rc.clone().map(|r| r.last));
         let (kept_ball, kept_target) = (self.ball, self.ball_target);
         let kept_curve = self.ball_curve;
 
@@ -556,23 +636,28 @@ impl Game {
             self.teams[t].hits = s.ht[t];
             self.teams[t].throws = s.th[t];
             self.teams[t].idx = s.ix[t] as usize % 3;
-            let d = &mut self.teams[t].dc;
-            d.cough = s.dc[t][1];
-            d.stop_show = s.dc[t][2];
-            d.hold = s.dc[t][3] > 0.5;
-            d.ht = s.dc[t][4];
-            d.mul = s.dc[t][5];
-            // the gauge on your own screen runs a round trip ahead of what the server reports
-            let lead = if self.my_team == Some(t) && d.hold { self.pred.rtt } else { 0.0 };
-            d.p = s.dc[t][0] + lead * (0.35 + d.ht * 0.28) * d.mul;
-            let r = &mut self.teams[t].rc;
-            r.last = match s.rc[t][0] as u8 {
-                1 => Some(Foot::L),
-                2 => Some(Foot::R),
-                _ => None,
-            };
-            r.lock = s.rc[t][1];
-            self.teams[t].early = s.rc[t][2];
+            for i in 0..3 {
+                let k = t * 3 + i;
+                let (Some(sd), Some(sr)) = (s.dc.get(k), s.rc.get(k)) else { continue };
+                let mine = self.my_players[t][i];
+                let d = &mut self.teams[t].dc[i];
+                d.cough = sd[1];
+                d.stop_show = sd[2];
+                d.hold = sd[3] > 0.5;
+                d.ht = sd[4];
+                d.mul = sd[5];
+                // the gauge on your own screen runs a round trip ahead of what the server reports
+                let lead = if mine && d.hold { self.pred.rtt } else { 0.0 };
+                d.p = sd[0] + lead * (0.35 + d.ht * 0.28) * d.mul;
+                let r = &mut self.teams[t].rc[i];
+                r.last = match sr[0] as u8 {
+                    1 => Some(Foot::L),
+                    2 => Some(Foot::R),
+                    _ => None,
+                };
+                r.lock = sr[1];
+                self.teams[t].early[i] = sr[2];
+            }
             self.teams[t].drinking = self.hitter == Some(t) && self.state == State::Run;
         }
         let dt_snap = 1.0 / SNAP_HZ;
@@ -638,11 +723,13 @@ impl Game {
         self.knocked = s.kn.iter().map(|v| ((v[0] as usize & 1, v[1] as usize % 3, v[2] as usize % 4), [v[3], v[4]])).collect();
         self.net_sneak = s.sn;
         self.net_run = s.rp;
+        self.net_ri = s.rr;
         self.net_status = s.status.clone();
         self.net_pause = (s.pz >= 0.0).then_some((s.pw, s.pz));
         self.net_aim_left = s.al;
         self.ref_bottle = (s.rb >= 0).then_some(((s.rb / 3) as usize & 1, (s.rb % 3) as usize));
         self.ref_hold = s.rh;
+        self.thrown_by = (s.tb >= 0).then_some(((s.tb / 3) as usize & 1, (s.tb % 3) as usize));
         self.pred.digest = self.digest();
 
         // and now put back what we know better than this snapshot does
@@ -650,17 +737,21 @@ impl Game {
             self.holder = None; // the ball is in your hand on the screen, see `aim_ball`
         }
         if let Some(t) = self.my_team {
-            if holding {
-                self.teams[t].dc.hold = kept_dc[t].hold;
-                self.teams[t].dc.ht = kept_dc[t].ht;
-                self.teams[t].dc.p = kept_dc[t].p;
-            }
-            if padding {
-                self.teams[t].rc.last = kept_last[t];
+            for i in (0..3).filter(|&i| self.my_players[t][i]) {
+                if holding {
+                    let (d, k) = (&mut self.teams[t].dc[i], &kept_dc[t][i]);
+                    d.hold = k.hold;
+                    d.ht = k.ht;
+                    d.p = k.p;
+                }
+                if padding {
+                    self.teams[t].rc[i].last = kept_last[t][i];
+                }
             }
         }
         if throwing && self.state == State::Aim {
             let t = self.turn;
+            self.thrown_by = Some((t, self.teams[t].idx));
             self.teams[t].idx = (self.teams[t].idx + 1) % 3;
             self.teams[t].throws += 1;
             self.state = State::Flight;
@@ -738,13 +829,14 @@ impl Game {
         self.pred.lead = self.pred.rtt;
     }
 
-    /// Mirror: start showing a new match.
+    /// Mirror: start showing a new match. Inputs keep counting up: the server's seat remembers the
+    /// last one it took (`a`) across matches, and turns down any number it has already seen.
     pub fn mirror_begin(&mut self, m: u32) {
         self.reset_game();
         self.mirror = true;
         self.mode = Mode::Online;
-        let rtt = self.pred.rtt;
-        self.pred = Pred { match_id: m, rtt, ..Pred::default() };
+        let (rtt, sent_n) = (self.pred.rtt, self.pred.sent_n);
+        self.pred = Pred { match_id: m, rtt, sent_n, ..Pred::default() };
         self.stat_ev.clear();
     }
 
@@ -815,28 +907,30 @@ impl Game {
         }
         for t in 0..2 {
             let can = self.state == State::Run && self.hitter == Some(t);
-            let d = &mut self.teams[t].dc;
-            if d.cough > 0.0 {
-                d.cough -= dt;
-                d.p = (d.p - dt * 0.5).max(0.0);
-            } else if d.hold && can {
-                d.ht += dt;
-                d.p = (d.p + dt * (0.35 + d.ht * 0.28) * d.mul.max(0.8)).min(1.0);
-            } else {
-                d.p = (d.p - dt * 0.9).max(0.0);
+            for d in self.teams[t].dc.iter_mut() {
+                if d.cough > 0.0 {
+                    d.cough -= dt;
+                    d.p = (d.p - dt * 0.5).max(0.0);
+                } else if d.hold && can {
+                    d.ht += dt;
+                    d.p = (d.p + dt * (0.35 + d.ht * 0.28) * d.mul.max(0.8)).min(1.0);
+                } else {
+                    d.p = (d.p - dt * 0.9).max(0.0);
+                }
+                if d.stop_show > 0.0 {
+                    d.stop_show -= dt;
+                }
             }
-            if d.stop_show > 0.0 {
-                d.stop_show -= dt;
-            }
-            let rc = &mut self.teams[t].rc;
-            for d in rc.down.iter_mut() {
-                *d -= dt;
-            }
-            if rc.msg_t > 0.0 {
-                rc.msg_t -= dt;
-            }
-            if rc.lock > 0.0 {
-                rc.lock -= dt;
+            for rc in self.teams[t].rc.iter_mut() {
+                for d in rc.down.iter_mut() {
+                    *d -= dt;
+                }
+                if rc.msg_t > 0.0 {
+                    rc.msg_t -= dt;
+                }
+                if rc.lock > 0.0 {
+                    rc.lock -= dt;
+                }
             }
         }
         self.mirror_anim(dt, ref_mouth, ref_tip);
@@ -935,12 +1029,12 @@ mod tests {
         }
         assert_eq!(srv.state, State::Run);
         let mut m = screen(1);
-        m.teams[0].dc.hold = true;
+        m.teams[0].dc[0].hold = true;
         m.pred.hold_n = 5;
         m.apply_snapshot(&wire(&srv.snapshot(1, 1, &log)), 4);
-        assert!(m.teams[0].dc.hold, "the server hasn't got the press yet");
+        assert!(m.teams[0].dc[0].hold, "the server hasn't got the press yet");
         m.apply_snapshot(&wire(&srv.snapshot(1, 2, &log)), 5);
-        assert!(!m.teams[0].dc.hold, "now the server decides");
+        assert!(!m.teams[0].dc[0].hold, "now the server decides");
     }
     #[test]
     fn events_are_delivered_once_and_gaps_are_noticed() {
@@ -983,16 +1077,144 @@ mod tests {
             for _ in 0..200 {
                 g.tick(1.0 / 60.0, Vec3::ZERO, Vec3::ZERO);
             }
-            g.drink_press(0);
+            g.drink_press(0, crate::game::ALL);
             let mut t = 0;
             while g.state == State::Run && t < 30000 {
                 g.tick(1.0 / 60.0, Vec3::ZERO, Vec3::ZERO);
-                g.teams[0].dc.p = 0.0; // never choke, keep holding
+                for d in g.teams[0].dc.iter_mut() {
+                    d.p = 0.0; // never choke, keep holding
+                }
                 g.teams[0].beers = [1.0; 3];
                 t += 1;
             }
-            g.teams[0].dc.stop_watch
+            g.teams[0].dc[0].stop_watch
         };
         assert!(run(0.4) > run(0.0) + 0.3);
+    }
+
+    #[test]
+    fn a_new_match_keeps_counting_inputs() {
+        // the server's seat remembers the last input it took across matches: starting again from 1
+        // would have every throw, sip and step of the next match turned down as old news
+        let mut m = screen(1);
+        m.pred.sent_n = 57;
+        m.pred.throw_n = 50;
+        m.mirror_begin(2);
+        assert_eq!(m.pred.sent_n, 57);
+        assert_eq!((m.pred.throw_n, m.pred.match_id), (0, 2));
+    }
+    #[test]
+    fn the_thrower_is_known_while_the_ball_flies() {
+        // two people on a team: once thrown, `idx` is already the next one's, a teammate's
+        let ms = crowd();
+        let mut g = Game::new(5);
+        g.start_match(Mode::Online, 1);
+        set_sides(&mut g, &ms, None);
+        g.restart_online();
+        let o = g.teams[0].players[0].hand();
+        g.launch(0, ThrowSpec { origin: o, yaw: (-o.x).atan2(-o.z), dist: 3.0, curve: 0.0, ring: 0 });
+        assert_eq!((g.thrown_by, g.teams[0].idx), (Some((0, 0)), 1));
+        let mut m = Game::new(1);
+        m.mirror_begin(1);
+        set_sides(&mut m, &ms, Some(1));
+        m.apply_snapshot(&wire(&g.snapshot(1, 1, &EvLog::default())), 0);
+        assert_eq!(m.thrown_by, Some((0, 0)));
+        // and on the thrower's own screen, before the server has the throw
+        let (srv, log) = server();
+        let mut p = screen(1);
+        p.apply_snapshot(&wire(&srv.snapshot(1, 1, &log)), 0);
+        p.predict_throw(perfect(&p), 1);
+        p.apply_snapshot(&wire(&srv.snapshot(1, 2, &log)), 0);
+        assert_eq!(p.thrown_by, Some((0, 0)));
+    }
+    #[test]
+    fn http_address_of_the_server() {
+        assert_eq!(http_url("wss://flunkiebal.flunkcie.nl"), "https://flunkiebal.flunkcie.nl");
+        assert_eq!(http_url("ws://127.0.0.1:8787/"), "http://127.0.0.1:8787");
+    }
+
+    fn crowd() -> Vec<Member> {
+        // three on the first team, two on the second
+        let m = |id: u32, team: u8| Member { id, name: format!("P{id}"), team, look: [0; 7], away: false };
+        vec![m(1, 0), m(2, 0), m(3, 0), m(4, 1), m(5, 1)]
+    }
+    fn hit_by(g: &mut Game, t: usize) {
+        g.state = State::Aim;
+        g.turn = t;
+        let o = g.teams[t].players[g.teams[t].idx].hand();
+        g.launch(t, ThrowSpec { origin: o, yaw: (-o.x).atan2(-o.z), dist: (o.x * o.x + o.z * o.z).sqrt() - 0.3, curve: 0.0, ring: 0 });
+        for _ in 0..400 {
+            g.tick(1.0 / 60.0, Vec3::ZERO, Vec3::ZERO);
+            if g.state == State::Run {
+                return;
+            }
+        }
+        panic!("no hit");
+    }
+    #[test]
+    fn everyone_drinks_their_own_beer() {
+        let ms = crowd();
+        let mut g = Game::new(5);
+        g.start_match(Mode::Online, 1);
+        set_sides(&mut g, &ms, None);
+        g.restart_online();
+        hit_by(&mut g, 0);
+        assert_eq!(owned(&ms, 0, 2), [false, true, false]);
+        g.drink_press(0, owned(&ms, 0, 2));
+        for _ in 0..30 {
+            g.tick(1.0 / 60.0, Vec3::ZERO, Vec3::ZERO);
+        }
+        let b = g.teams[0].beers;
+        assert!(b[1] < 1.0, "the one holding drinks");
+        assert_eq!((b[0], b[2]), (1.0, 1.0), "the others don't: {b:?}");
+        assert!(g.teams[0].dc[1].hold && !g.teams[0].dc[0].hold);
+        // a screen shows its own gauge, not a teammate's
+        let mut m = Game::new(1);
+        m.mirror_begin(1);
+        set_sides(&mut m, &ms, Some(1));
+        m.apply_snapshot(&wire(&g.snapshot(1, 1, &EvLog::default())), 0);
+        assert!(m.teams[0].dc[1].hold && !m.teams[0].dc[0].hold);
+        assert_eq!(m.teams[0].lead(m.my_players[0]), Some(0));
+    }
+    #[test]
+    fn everyone_runs_their_own_runner() {
+        let ms = crowd();
+        let mut g = Game::new(5);
+        g.start_match(Mode::Online, 1);
+        set_sides(&mut g, &ms, None);
+        g.restart_online();
+        hit_by(&mut g, 0);
+        let (rt, a, b) = g.runners().unwrap();
+        assert_eq!(rt, 1);
+        let b = b.unwrap();
+        // two people on that team: one runner each
+        let (wa, wb) = (owner_of(&ms, 1, a).unwrap().id, owner_of(&ms, 1, b).unwrap().id);
+        assert_ne!(wa, wb);
+        let (b0, b20) = { let r = g.run.as_ref().unwrap(); (r.boost, r.boost2) };
+        g.pad_press(1, owned(&ms, 1, wa), Foot::L);
+        let r = g.run.as_ref().unwrap();
+        assert!(r.boost > b0 && r.boost2 <= b20, "only their own runner speeds up");
+        // the mirror knows who runs, so only those two get pads
+        let mut m = Game::new(1);
+        m.mirror_begin(1);
+        set_sides(&mut m, &ms, Some(wb));
+        m.apply_snapshot(&wire(&g.snapshot(1, 1, &EvLog::default())), 0);
+        assert_eq!(m.running_of(1, m.my_players[1]), (false, true));
+    }
+    #[test]
+    fn knocking_over_a_beer_is_its_owners_strafbier() {
+        let (mut g, _) = server();
+        g.turn = 0;
+        g.state = State::Flight;
+        g.holder = None;
+        g.ball_free = true;
+        let cp = g.teams[1].can_pos(1, 0);
+        g.ball = vec3(cp[0], BR, cp[1] + 0.4);
+        g.ball_vel = vec3(0.0, 0.0, -3.0);
+        for _ in 0..60 {
+            g.tick(1.0 / 60.0, Vec3::ZERO, Vec3::ZERO);
+        }
+        assert_eq!(g.knocked.len(), 1, "the ball rolled into their beer");
+        assert_eq!((g.teams[0].straf, g.teams[1].straf), (0, 1));
     }
 }

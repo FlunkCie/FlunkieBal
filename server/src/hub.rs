@@ -20,11 +20,16 @@ pub enum Event {
     Hashed { conn: u64, user: String, name: String, hash: Result<String, String> },
     /// A login's password, checked.
     Checked { conn: u64, user: String, code: String, name: String, ok: bool },
+    /// A phone's background check over plain HTTP (`NOTES_PATH`): the answer goes back as JSON, or
+    /// None for a code and secret that aren't an account.
+    Notes { req: NotesReq, reply: tokio::sync::oneshot::Sender<Option<String>> },
 }
 
 /// Logins and sign-ups a connection may try per minute, and wrong passwords per username per 15 minutes.
 const AUTH_PER_MIN: u32 = 10;
 const FAILS_PER_USER: u32 = 10;
+/// Bug reports a connection may send per 10 minutes.
+const BUGS_PER_10_MIN: usize = 3;
 /// Passwords being hashed at once (each takes ~19 MB for a moment).
 const MAX_HASHING: usize = 8;
 
@@ -58,6 +63,8 @@ struct Client {
     auths: u32,
     auth_window: Instant,
     authing: bool,
+    /// bug reports sent lately
+    bugs: Vec<Instant>,
 }
 
 pub struct Hub {
@@ -77,6 +84,13 @@ pub struct Hub {
 const TICK: Duration = Duration::from_micros(16_667);
 const MAX_RATE: u32 = 200;
 const MAX_ROOMS: usize = 2000;
+
+fn bugs_path() -> String {
+    std::env::var("FLUNKI_BUGS").unwrap_or_else(|_| {
+        let data = std::env::var("FLUNKI_DATA").unwrap_or_else(|_| "flunkiebal-data.json".into());
+        std::path::Path::new(&data).with_file_name("flunkiebal-bugs.jsonl").to_string_lossy().into_owned()
+    })
+}
 
 fn clean(s: &str) -> String {
     let t: String = s.chars().filter(|c| !c.is_control()).take(16).collect();
@@ -208,7 +222,16 @@ impl Hub {
         match e {
             Event::Open { conn, addr } => {
                 debug!("conn={} open from {addr}", conn.id);
-                self.clients.insert(conn.id, Client { addr, seat: None, bad: 0, rate: 0, last_heard: Instant::now(), auths: 0, auth_window: Instant::now(), authing: false, conn });
+                // first of all: which build is the newest, so an old game can say so
+                let _ = conn.tx.send(out(&FromServer::Latest { build: APP_BUILD }));
+                self.clients.insert(conn.id, Client { addr, seat: None, bad: 0, rate: 0, last_heard: Instant::now(), auths: 0, auth_window: Instant::now(), authing: false, bugs: Vec::new(), conn });
+            }
+            Event::Notes { req, reply } => {
+                let found = self.social.notes_for(&req.code, &req.secret, req.after, |r| self.room_open(r));
+                if found.is_none() {
+                    debug!("notes: a check for {} that isn't an account", req.code);
+                }
+                let _ = reply.send(found.map(|notes| serde_json::to_string(&NotesResp { notes, build: APP_BUILD }).unwrap_or_default()));
             }
             Event::Close { conn, why } => self.closed(conn, why),
             Event::Stuck { conn } => {
@@ -224,7 +247,10 @@ impl Hub {
                     "Something went wrong, try again".to_string()
                 });
                 match res.and_then(|h| self.social.register(conn, &user, h, &name)) {
-                    Ok(m) => self.deliver(m),
+                    Ok(m) => {
+                        self.deliver(m);
+                        self.logged_in(conn);
+                    }
                     Err(msg) => self.tell(conn, &FromServer::AuthErr { msg }),
                 }
             }
@@ -237,6 +263,7 @@ impl Hub {
                     info!("friends: conn={conn} logged in as user {user}");
                     let m = self.social.attach(conn, &code, &name);
                     self.deliver(m);
+                    self.logged_in(conn);
                 } else {
                     let f = self.fails.entry(user.clone()).or_insert((Instant::now(), 0));
                     f.1 += 1;
@@ -266,6 +293,51 @@ impl Hub {
                     }
                 }
             }
+        }
+    }
+    /// Keep a bug report: one JSON line each in `FLUNKI_BUGS` (by default next to the friends data).
+    fn bug(&mut self, conn: u64, v: u32, text: String, info: String) {
+        let account = self.social.account_of(conn);
+        let Some(c) = self.clients.get_mut(&conn) else { return };
+        c.bugs.retain(|t| t.elapsed().as_secs() < 600);
+        if c.bugs.len() >= BUGS_PER_10_MIN {
+            self.tell(conn, &FromServer::BugSaved { ok: false, msg: "That's a lot of reports: try again in a few minutes".into() });
+            return;
+        }
+        let text: String = text.chars().filter(|c| *c == '\n' || !c.is_control()).take(BUG_TEXT).collect();
+        if text.trim().is_empty() {
+            self.tell(conn, &FromServer::BugSaved { ok: false, msg: "Say what went wrong first".into() });
+            return;
+        }
+        c.bugs.push(Instant::now());
+        let info: String = info.chars().take(BUG_INFO).collect();
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let line = serde_json::json!({ "at": at, "from": c.addr.ip().to_string(), "account": account, "protocol": v, "text": text, "info": info });
+        let path = bugs_path();
+        let saved = std::fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "{line}")
+        });
+        match saved {
+            Ok(()) => {
+                warn!("bug report from conn={conn} ({}): {}", account.as_deref().unwrap_or("not logged in"), text.chars().take(200).collect::<String>().replace('\n', " "));
+                self.tell(conn, &FromServer::BugSaved { ok: true, msg: String::new() });
+            }
+            Err(e) => {
+                warn!("couldn't keep a bug report in {path}: {e}");
+                self.tell(conn, &FromServer::BugSaved { ok: false, msg: "The server couldn't keep it, sorry. Try again later".into() });
+            }
+        }
+    }
+    /// Can people still join this room?
+    fn room_open(&self, room: &str) -> bool {
+        self.rooms.get(room).map_or(false, |r| r.phase != PHASE_PLAYING && r.seats.len() < MAX_PEOPLE)
+    }
+    /// Just logged in: the invites that came while they were away, to rooms they can still join.
+    fn logged_in(&mut self, conn: u64) {
+        let waiting = self.social.waiting_invites(conn);
+        for (code, name, room) in waiting.into_iter().filter(|(_, _, r)| self.room_open(r)) {
+            self.tell(conn, &FromServer::Invited { code, name, room });
         }
     }
     fn closed(&mut self, conn: u64, why: &str) {
@@ -343,7 +415,10 @@ impl Hub {
                     return;
                 }
                 match self.social.hello(conn, &code, &secret, &clean(&name)) {
-                    Ok(m) => self.deliver(m),
+                    Ok(m) => {
+                        self.deliver(m);
+                        self.logged_in(conn);
+                    }
                     Err(msg) => self.tell(conn, &FromServer::SocialErr { msg }),
                 }
             }
@@ -393,13 +468,13 @@ impl Hub {
                 });
             }
             ToServer::SName { .. } | ToServer::SProgress { .. } | ToServer::SStatus { .. } | ToServer::FriendAdd { .. } | ToServer::FriendRemove { .. } | ToServer::Say { .. } | ToServer::ChatOpen { .. } | ToServer::FriendStats { .. } | ToServer::Invite { .. } => {
-                let room_ok = |room: &str| self.rooms.get(room).map_or(false, |r| r.phase != PHASE_PLAYING && r.seats.len() < MAX_PEOPLE);
-                let can_invite = if let ToServer::Invite { room, .. } = &m { room_ok(room) } else { true };
+                let can_invite = if let ToServer::Invite { room, .. } = &m { self.room_open(room) } else { true };
                 match self.social.handle(conn, m, can_invite) {
                     Ok(out) => self.deliver(out),
                     Err(msg) => self.tell(conn, &FromServer::SocialErr { msg }),
                 }
             }
+            ToServer::Bug { v, text, info } => self.bug(conn, v, text, info),
             ToServer::List => {
                 let rooms = self.rooms.iter().filter(|(_, r)| r.open && r.phase != PHASE_PLAYING && r.seats.len() < MAX_PEOPLE).map(|(c, r)| RoomInfo { code: c.clone(), name: r.host_name(), n: r.seats.len() }).take(20).collect();
                 self.tell(conn, &FromServer::Rooms { rooms });
