@@ -1,6 +1,6 @@
 // FlunkieBal scene shader: one uber-shader, the instance's `params.x` picks the material.
 // 0 lit · 1 unlit · 2 soft disc (smoke, glow) · 3 lawn · 4 referee gaze fan · 5 sky · 6 water · 7 volleyball
-// 8 wood · 9 pavers · 10 dance floor · 11 facades · 12 brick · 13 bark · 14 leaves · 15 grass blades · 16 plaster · 17 asphalt · 18 light beam
+// 8 wood · 9 pavers · 10 dance floor · 11 facades · 12 brick · 13 bark · 14 leaves · 15 grass blades (vs_grass) · 16 plaster · 17 asphalt · 18 light beam
 //
 // Lighting is physically based (GGX specular, Fresnel, energy-conserving diffuse) with a sun, up to six
 // lamps with inverse-square falloff, a hemisphere/bounce ambient with reflections, soft shadows from
@@ -80,11 +80,18 @@ fn lawn_col(p: vec2<f32>) -> vec3<f32> {
   return c;
 }
 fn path_x(z: f32) -> f32 { return -11.5 + sin(z * 0.07) * 3.0; }
-/// How tall the grass grows here: short where it is worn, gone on the chalk lines and the path.
-fn grass_height(p: vec2<f32>) -> f32 {
-  var h = (1.0 - pitch_wear(p) * 0.95) * (0.65 + 0.7 * vnoise(p * 0.6));
+/// How tall the grass grows here (`worn`: `pitch_wear` there): short where it is worn, gone on the chalk lines and the path.
+fn grass_height(p: vec2<f32>, worn: f32) -> f32 {
+  var h = (1.0 - worn * 0.95) * (0.65 + 0.7 * vnoise(p * 0.6));
   h = h * smoothstep(0.3, 0.55, length(p));
   h = h * smoothstep(1.25, 1.6, abs(p.x - path_x(p.y)));
+  // none in the pond, on the cross path (slabs 7 m long) or under the picnic blankets
+  let pond = (p - vec2<f32>(20.0, -22.0)) / vec2<f32>(11.9, 7.9);
+  h = h * smoothstep(1.0, 1.06, dot(pond, pond));
+  let xc = -8.0 + 7.0 * clamp(round((p.x + 8.0) / 7.0), 0.0, 9.0);
+  let on_path = step(-11.7, p.x) * step(p.x, 55.7) * step(abs(p.y - 19.0 - sin(xc * 0.09) * 1.5), 1.12);
+  h = h * (1.0 - on_path);
+  h = h * step(1.05, length(p - vec2<f32>(14.0, 10.0))) * step(1.05, length(p - vec2<f32>(-6.0, -18.5))) * step(1.05, length(p - vec2<f32>(15.0, -9.0)));
   return h;
 }
 fn wind(p: vec2<f32>, t: f32) -> vec2<f32> {
@@ -96,14 +103,6 @@ fn wind(p: vec2<f32>, t: f32) -> vec2<f32> {
 fn deform(v: VIn, m: mat4x4<f32>) -> vec4<f32> {
   let kind = i32(v.params.x + 0.5);
   let t = g.misc.x;
-  if (kind == 15) {
-    let root = m * vec4<f32>(v.pos.x, 0.0, v.pos.z, 1.0);
-    let hf = grass_height(root.xz);
-    var w = m * vec4<f32>(v.pos.x, v.pos.y * hf, v.pos.z, 1.0);
-    let s = wind(root.xz, t) * (v.uv.y * v.uv.y * 0.03 * hf);
-    w.x = w.x + s.x; w.z = w.z + s.y;
-    return w;
-  }
   var w = m * vec4<f32>(v.pos, 1.0);
   if (kind == 14) {
     let s = sin(t * 1.6 + w.x * 0.7 + w.y * 0.9) * 0.022 + sin(t * 4.3 + w.z * 3.1 + w.x) * 0.008;
@@ -126,7 +125,6 @@ fn vs_main(v: VIn) -> VOut {
   o.color = v.color;
   let kind = i32(v.params.x + 0.5);
   if (kind == 14) { o.color.a = length(v.pos); } // how deep in the clump: inner leaves get less light
-  if (kind == 15) { o.color = vec4<f32>(m[3].x + v.pos.x, m[3].z + v.pos.z, 0.0, 1.0); } // blade root, for its colour
   o.params = v.params;
   return o;
 }
@@ -192,8 +190,94 @@ fn vs_skin_shadow(v: SIn) -> @builtin(position) vec4<f32> {
   return g.light_vp * skin_m(v) * vec4<f32>(v.pos, 1.0);
 }
 
+// ---------- grass: every blade made up here from its number, no mesh ----------
+// One instance is a tile of GRASS_TILE metres (its corner, in whole tiles, in m3.xz; color.x = how dense);
+// vertex_index / 7 is the blade, % 7 the point on it: base pair, two joint pairs and the tip. A blade
+// further off than its density reaches shrinks away, and those left widen to cover what the others did.
+const GRASS_TILE: f32 = 1.0;
+const GRASS_NB: f32 = 768.0;
+const GRASS_D0: f32 = 5.0;
+const GRASS_FAR: f32 = 30.0;
+struct GIn {
+  @builtin(vertex_index) vi: u32,
+  @location(3) m0: vec4<f32>,
+  @location(4) m1: vec4<f32>,
+  @location(5) m2: vec4<f32>,
+  @location(6) m3: vec4<f32>,
+  @location(7) color: vec4<f32>,
+  @location(8) params: vec4<f32>,
+};
+fn pcg(v: u32) -> u32 {
+  let s = v * 747796405u + 2891336453u;
+  let w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+  return (w >> 22u) ^ w;
+}
+fn unit(h: u32) -> f32 { return f32(h >> 8u) / 16777216.0; }
+@vertex
+fn vs_grass(v: GIn) -> VOut {
+  let blade = v.vi / 7u;
+  let j = v.vi % 7u;
+  let tile = vec2<i32>(i32(floor(v.m3.x + 0.5)), i32(floor(v.m3.z + 0.5)));
+  var h0 = pcg(blade * 2654435769u ^ (u32(tile.x) * 73856093u) ^ (u32(tile.y) * 19349663u));
+  let h1 = pcg(h0); let h2 = pcg(h1); let h3 = pcg(h2); let h4 = pcg(h3); let h5 = pcg(h4); let h6 = pcg(h5); let h7 = pcg(h6);
+  let root2 = (vec2<f32>(tile) + vec2<f32>(unit(h0), unit(h1))) * GRASS_TILE;
+  let root = vec3<f32>(root2.x, 0.0, root2.y);
+  let d = distance(g.cam_pos.xyz, root);
+  let n = GRASS_NB * v.color.x * min(1.0, pow(GRASS_D0 / max(d, 0.01), 1.5));
+  let worn = pitch_wear(root2);
+  // worn ground keeps only a few blades, and short ones
+  let sparse = step(worn * 0.9, unit(pcg(h6 + 1u)));
+  let fade = clamp(n - f32(blade), 0.0, 1.0) * smoothstep(GRASS_FAR, GRASS_FAR - 5.0, d) * sparse;
+  let r2 = unit(h2);
+  let hf = grass_height(root2, worn);
+  let len = (0.05 + r2 * 0.08 + r2 * r2 * 0.05) * hf * fade;
+  let wide = clamp(sqrt(GRASS_NB * v.color.x / max(n, 1.0)), 1.0, 3.5);
+  let wid = (0.005 + unit(h3) * 0.004) * wide * min(fade * 4.0, 1.0);
+  let yaw = unit(h4) * 6.2831853;
+  let side = vec3<f32>(cos(yaw), 0.0, sin(yaw));
+  let fwd = vec3<f32>(-sin(yaw), 0.0, cos(yaw));
+  let bend = 0.1 + unit(h5) * 0.55;
+  let row = j / 2u;
+  var tt = array<f32, 4>(0.0, 0.4, 0.75, 1.0);
+  var ww = array<f32, 4>(1.0, 0.9, 0.62, 0.0);
+  let t = tt[row];
+  let sd = select(-1.0, 1.0, (j & 1u) == 1u);
+  // a breeze rolling over the lawn in waves; every blade gives way a little differently
+  let time = g.misc.x;
+  let wave = 0.55 + 0.45 * sin(dot(root2, vec2<f32>(0.31, 0.22)) - time * 1.7);
+  let s = wind(root2, time) * (wave * 0.32 * len * t * t * (0.7 + 0.6 * unit(h6)));
+  let p = root + vec3<f32>(0.0, len * t * (1.0 - 0.3 * bend * t), 0.0) + fwd * (bend * len * t * t) + side * (sd * wid * ww[row]) + vec3<f32>(s.x, 0.0, s.y);
+  var o: VOut;
+  o.clip = g.view_proj * vec4<f32>(p, 1.0);
+  o.wpos = p;
+  // mostly up, so the lawn reads as one surface, curling round the blade's edges
+  o.nrm = normalize(fwd * 0.45 + side * (sd * ww[row] * 0.35) + vec3<f32>(0.0, 0.85, 0.0));
+  let r7 = unit(h7);
+  var c = lawn_col(root2) * (0.8 + 0.4 * r7);
+  // a few blades dried out, more where the lawn is worn
+  let dry = step(0.94 - worn * 0.3, unit(pcg(h7)));
+  c = mix(c, vec3<f32>(0.36, 0.32, 0.13) * (0.7 + 0.5 * r7), dry * 0.75);
+  o.color = vec4<f32>(c, 1.0);
+  o.uv = vec2<f32>(r7, t);
+  o.params = vec4<f32>(15.0, 0.0, 0.0, 0.0);
+  return o;
+}
+@fragment
+fn fs_grass(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
+  var n = normalize(i.nrm);
+  if (!ff) { n = normalize(vec3<f32>(-n.x, n.y, -n.z)); }
+  let h = i.uv.y;
+  // darker down among the roots, lighter and a touch yellow at the tip
+  var base = i.color.rgb * mix(0.55, 1.08, h);
+  base = mix(base, base * vec3<f32>(1.25, 1.15, 0.65), smoothstep(0.75, 1.0, h) * (0.15 + 0.4 * i.uv.x));
+  var col = shade(Surf(base, n, 0.6, 0.04, mix(0.55, 1.0, h), 0.45), i.wpos);
+  col = fogged(col, i.wpos);
+  return finish(col, 1.0);
+}
+
 // ---------- light ----------
 fn shadow_at(wpos: vec3<f32>, n: vec3<f32>) -> f32 {
+  if (g.misc.y <= 0.0) { return 1.0; } // shadows switched off
   let spot = g.sun_dir.w > 0.0;
   let lp = g.light_vp * vec4<f32>(wpos + n * select(0.03, 0.02, spot), 1.0);
   if (lp.w <= 0.0) { return 1.0; }
@@ -381,6 +465,100 @@ fn wood_h(al: f32, ac: f32, pw: f32, seglen: f32) -> vec4<f32> {
   return vec4<f32>(groove, tone, grain, row);
 }
 
+// The materials that cover most of the screen have their own entry points too (fs_lit, fs_lawn, fs_sky,
+// fs_leaf): a shader holding only one material needs far fewer registers than the whole of fs_main.
+// 0: lit
+fn m_lit(i: VOut) -> vec4<f32> {
+  let n = normalize(i.nrm);
+  var col = i.color.rgb;
+  var a = i.color.a;
+  let p = i.wpos;
+  var base = i.color.rgb;
+  var rough = 0.62;
+  if (i.params.w > 0.5) { // vertical stripes (the referee's shirt)
+    if (fract(i.uv.x * i.params.w) < 0.5) { base = vec3<f32>(0.03, 0.03, 0.035); }
+  }
+  col = shade(Surf(base, n, rough, 0.04, room_ao(p, n), 0.0), p) + base * i.params.y * 1.6;
+  col = fogged(col, p);
+  return vec4<f32>(col, a);
+}
+// 3: the lawn
+fn m_lawn(i: VOut) -> vec4<f32> {
+  var col = i.color.rgb;
+  var a = i.color.a;
+  let p = i.wpos;
+  let q = p.xz;
+  var base = lawn_col(q);
+  let worn = pitch_wear(q);
+  let dirt = vec3<f32>(0.33, 0.27, 0.17) * (0.8 + 0.4 * vnoise(q * 13.0));
+  base = mix(base, dirt, worn * 0.8);
+  base = base * (0.9 + 0.2 * vnoise(q * 31.0));
+  // the gravel path
+  let pd = abs(q.x - path_x(q.y));
+  let gravel = vec3<f32>(0.62, 0.55, 0.42) * (0.75 + 0.5 * hash2(floor(q * 40.0)));
+  base = mix(base, gravel, smoothstep(1.5, 1.25, pd) * step(q.y, 60.0) * step(-61.0, q.y));
+  let hx = vnoise(q * 18.0 + vec2<f32>(0.37, 0.0)) - vnoise(q * 18.0);
+  let hz = vnoise(q * 18.0 + vec2<f32>(0.0, 0.37)) - vnoise(q * 18.0);
+  let nn = bump(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), hx * 0.5, hz * 0.5);
+  // grass that isn't worn shades its own roots: deep down among the blades round the camera, a little further off
+  let under = mix(0.5, 0.75, smoothstep(10.0, 24.0, distance(g.cam_pos.xz, q)));
+  col = shade(Surf(base, nn, 0.92, 0.03, mix(under, 1.0, worn), 0.0), p);
+  col = fogged(col, p);
+  return vec4<f32>(col, a);
+}
+// 5: sky
+fn m_sky(i: VOut) -> vec4<f32> {
+  var col = i.color.rgb;
+  var a = i.color.a;
+  let t = g.misc.x;
+  let p = i.wpos;
+  let d = normalize(p - g.cam_pos.xyz);
+  let h = clamp(d.y, -0.2, 1.0);
+  col = mix(g.sky_hor.rgb, g.sky_top.rgb, pow(max(h, 0.0), 0.45)) * 1.1;
+  let s = max(dot(d, normalize(g.sun_dir.xyz)), 0.0);
+  col = col + g.sun_col.rgb * (pow(s, 900.0) * 6.0 + pow(s, 14.0) * 0.16 + pow(s, 3.0) * 0.05);
+  // layered clouds, lit from the sun's side
+  if (h > 0.02) {
+    let cp = d.xz / (h + 0.15) * 1.6 + vec2<f32>(t * 0.008, 0.0);
+    let dens = fbm(cp) * 0.7 + vnoise(cp * 3.7) * 0.3;
+    let cl = smoothstep(0.5, 0.82, dens);
+    let lit = 0.75 + 0.45 * s;
+    col = mix(col, vec3<f32>(1.0, 0.96, 0.92) * lit * 1.25, cl * 0.6 * smoothstep(0.02, 0.22, h));
+  }
+  if (d.y < 0.0) { col = mix(g.sky_hor.rgb, g.ground_col.rgb * 0.8, clamp(-d.y * 6.0, 0.0, 1.0)); }
+  // the horizon dissolves into the same haze the far trees do
+  let sky_fog = 1.0 - exp(-g.fog.w * 45.0 / max(d.y, 0.03));
+  col = mix(col, fog_col(d), clamp(sky_fog, 0.0, 1.0));
+  return vec4<f32>(col, a);
+}
+// 14: leaves
+fn m_leaf(i: VOut) -> vec4<f32> {
+  let n = normalize(i.nrm);
+  var col = i.color.rgb;
+  var a = i.color.a;
+  let p = i.wpos;
+  // leaves: the card is cut to a leaf; each leaf has its own shade of green
+  let m = leaf_mask(i.uv);
+  if (m < 0.0) { discard; }
+  let id = floor(i.uv.x);
+  let h = hash2(vec2<f32>(id, i.color.r * 37.0 + i.params.w));
+  var base = i.color.rgb * (0.7 + 0.5 * h);
+  base = mix(base, base * vec3<f32>(1.25, 1.1, 0.55), step(0.9, h) * 0.6); // a few yellowing
+  let vein = 1.0 - 0.18 * smoothstep(0.06, 0.0, abs(fract(i.uv.x) * 2.0 - 1.0));
+  base = base * vein;
+  let nn = n;
+  let depth = clamp(i.color.a, 0.0, 1.0); // 0.3 in the middle of the clump … 1 at the outside
+  let ao = mix(0.35, 1.0, smoothstep(0.3, 1.0, depth));
+  col = shade(Surf(base, nn, 0.5, 0.045, ao, 0.4), p);
+  col = fogged(col, p);
+  a = 1.0;
+  return vec4<f32>(col, a);
+}
+@fragment fn fs_lit(i: VOut) -> @location(0) vec4<f32> { let r = m_lit(i); return finish(r.rgb, r.a); }
+@fragment fn fs_lawn(i: VOut) -> @location(0) vec4<f32> { let r = m_lawn(i); return finish(r.rgb, r.a); }
+@fragment fn fs_sky(i: VOut) -> @location(0) vec4<f32> { let r = m_sky(i); return finish(r.rgb, r.a); }
+@fragment fn fs_leaf(i: VOut) -> @location(0) vec4<f32> { let r = m_leaf(i); return finish(r.rgb, 1.0); }
+
 @fragment
 fn fs_main(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
   let kind = i32(i.params.x + 0.5);
@@ -390,13 +568,7 @@ fn fs_main(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
   let t = g.misc.x;
   let p = i.wpos;
   if (kind == 0) {
-    var base = i.color.rgb;
-    var rough = 0.62;
-    if (i.params.w > 0.5) { // vertical stripes (the referee's shirt)
-      if (fract(i.uv.x * i.params.w) < 0.5) { base = vec3<f32>(0.03, 0.03, 0.035); }
-    }
-    col = shade(Surf(base, n, rough, 0.04, room_ao(p, n), 0.0), p) + base * i.params.y * 1.6;
-    col = fogged(col, p);
+    let r = m_lit(i); col = r.rgb; a = r.a;
   } else if (kind == 1) {
     col = i.color.rgb * 1.6;
     if (i.params.w > 0.5) { col = fogged(col, p); }
@@ -407,22 +579,7 @@ fn fs_main(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     let hemi = mix(g.ground_col.rgb, g.sky_top.rgb, 0.8);
     col = mix(i.color.rgb, i.color.rgb * (hemi * 0.7 + g.sun_col.rgb * 0.45), i.params.w);
   } else if (kind == 3) {
-    let q = p.xz;
-    var base = lawn_col(q);
-    let worn = pitch_wear(q);
-    let dirt = vec3<f32>(0.33, 0.27, 0.17) * (0.8 + 0.4 * vnoise(q * 13.0));
-    base = mix(base, dirt, worn * 0.8);
-    base = base * (0.9 + 0.2 * vnoise(q * 31.0));
-    // the gravel path
-    let pd = abs(q.x - path_x(q.y));
-    let gravel = vec3<f32>(0.62, 0.55, 0.42) * (0.75 + 0.5 * hash2(floor(q * 40.0)));
-    base = mix(base, gravel, smoothstep(1.5, 1.25, pd) * step(q.y, 60.0) * step(-61.0, q.y));
-    let hx = vnoise(q * 18.0 + vec2<f32>(0.37, 0.0)) - vnoise(q * 18.0);
-    let hz = vnoise(q * 18.0 + vec2<f32>(0.0, 0.37)) - vnoise(q * 18.0);
-    let nn = bump(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), hx * 0.5, hz * 0.5);
-    // grass that isn't worn shades its own roots a little
-    col = shade(Surf(base, nn, 0.92, 0.03, mix(0.75, 1.0, worn), 0.0), p);
-    col = fogged(col, p);
+    col = m_lawn(i).rgb;
   } else if (kind == 4) {
     let u = i.uv.x; let v = i.uv.y;
     let e = max(exp(-u / 0.035), exp(-(1.0 - u) / 0.035));
@@ -434,23 +591,7 @@ fn fs_main(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     a = clamp(i.color.a * (fill * 0.5 + band * fade * 0.45), 0.0, 1.0);
     col = i.color.rgb * 1.15;
   } else if (kind == 5) {
-    let d = normalize(p - g.cam_pos.xyz);
-    let h = clamp(d.y, -0.2, 1.0);
-    col = mix(g.sky_hor.rgb, g.sky_top.rgb, pow(max(h, 0.0), 0.45)) * 1.1;
-    let s = max(dot(d, normalize(g.sun_dir.xyz)), 0.0);
-    col = col + g.sun_col.rgb * (pow(s, 900.0) * 6.0 + pow(s, 14.0) * 0.16 + pow(s, 3.0) * 0.05);
-    // layered clouds, lit from the sun's side
-    if (h > 0.02) {
-      let cp = d.xz / (h + 0.15) * 1.6 + vec2<f32>(t * 0.008, 0.0);
-      let dens = fbm(cp) * 0.7 + vnoise(cp * 3.7) * 0.3;
-      let cl = smoothstep(0.5, 0.82, dens);
-      let lit = 0.75 + 0.45 * s;
-      col = mix(col, vec3<f32>(1.0, 0.96, 0.92) * lit * 1.25, cl * 0.6 * smoothstep(0.02, 0.22, h));
-    }
-    if (d.y < 0.0) { col = mix(g.sky_hor.rgb, g.ground_col.rgb * 0.8, clamp(-d.y * 6.0, 0.0, 1.0)); }
-    // the horizon dissolves into the same haze the far trees do
-    let sky_fog = 1.0 - exp(-g.fog.w * 45.0 / max(d.y, 0.03));
-    col = mix(col, fog_col(d), clamp(sky_fog, 0.0, 1.0));
+    col = m_sky(i).rgb;
   } else if (kind == 6) {
     let w1 = vnoise(p.xz * 1.5 + vec2<f32>(t * 0.3, t * 0.2)) - 0.5;
     let w2 = vnoise(p.xz * 4.3 - vec2<f32>(t * 0.5, -t * 0.1)) - 0.5;
@@ -573,32 +714,7 @@ fn fs_main(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     col = shade(Surf(base, nn, 0.92, 0.03, mix(0.6, 1.0, fur), 0.0), p);
     col = fogged(col, p);
   } else if (kind == 14) {
-    // leaves: the card is cut to a leaf; each leaf has its own shade of green
-    let m = leaf_mask(i.uv);
-    if (m < 0.0) { discard; }
-    let id = floor(i.uv.x);
-    let h = hash2(vec2<f32>(id, i.color.r * 37.0 + i.params.w));
-    var base = i.color.rgb * (0.7 + 0.5 * h);
-    base = mix(base, base * vec3<f32>(1.25, 1.1, 0.55), step(0.9, h) * 0.6); // a few yellowing
-    let vein = 1.0 - 0.18 * smoothstep(0.06, 0.0, abs(fract(i.uv.x) * 2.0 - 1.0));
-    base = base * vein;
-    let nn = n;
-    let depth = clamp(i.color.a, 0.0, 1.0); // 0.3 in the middle of the clump … 1 at the outside
-    let ao = mix(0.35, 1.0, smoothstep(0.3, 1.0, depth));
-    col = shade(Surf(base, nn, 0.5, 0.045, ao, 0.4), p);
-    col = fogged(col, p);
-    a = 1.0;
-  } else if (kind == 15) {
-    // grass blades: darker at the root, lighter and a touch yellow at the tip
-    let root = i.color.xy;
-    let h = i.uv.y;
-    var base = lawn_col(root) * mix(0.75, 1.15, h);
-    base = mix(base, base * vec3<f32>(1.3, 1.2, 0.6), smoothstep(0.7, 1.0, h) * (0.3 + 0.5 * i.uv.x));
-    base = base * (0.8 + 0.4 * i.uv.x);
-    var nn = n;
-    if (!ff) { nn = normalize(vec3<f32>(-n.x, n.y, -n.z)); }
-    col = shade(Surf(base, nn, 0.7, 0.04, mix(0.7, 1.0, h), 0.45), p);
-    col = fogged(col, p);
+    col = m_leaf(i).rgb;
     a = 1.0;
   } else if (kind == 18) {
     // a beam of light in smoky air: soft at its edges, dying away from the lamp
@@ -625,6 +741,10 @@ fn fs_main(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
   }
   // in a dark room the referee's gaze is a hint on the floor, not a floodlight
   if (kind == 4 && g.grade.w > 0.0) { a = a * 0.32; }
+  return finish(col, a);
+}
+
+fn finish(col: vec3<f32>, a: f32) -> vec4<f32> {
   // with an HDR target the film curve and the grading happen in the final copy, after bloom
   if (g.cam_pos.w > 1.5) { return vec4<f32>(clamp(col, vec3<f32>(0.0), vec3<f32>(48.0)), a); }
   // colour grading: a little contrast and saturation

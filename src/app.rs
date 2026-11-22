@@ -180,6 +180,9 @@ pub struct FlunkiApp {
     pub(crate) hide_meshes: Vec<u8>,
     pub(crate) fps_dt: f32,
     pub(crate) render_scale: f32,
+    /// the refresh rate asked of the screen (Android), so it's asked again only when the setting changes
+    #[cfg(target_os = "android")]
+    fps_asked: Option<bool>,
     pub(crate) scale_lock: bool,
     /// dynamic resolution: how long it's been too slow and fast enough, and no step up before this
     scale_wait: (f32, f32),
@@ -295,6 +298,8 @@ impl FlunkiApp {
             hide_meshes: Vec::new(),
             fps_dt: 0.016,
             render_scale: 1.0,
+            #[cfg(target_os = "android")]
+            fps_asked: None,
             scale_lock: false,
             scale_wait: (0.0, 0.0),
             scale_up_after: 0.0,
@@ -2077,16 +2082,20 @@ impl eframe::App for FlunkiApp {
             self.heads = out.heads;
         }
         let lk = self.scene_look(shown);
-        // a phone that's struggling goes without the distant grass first
-        if self.render_scale < 0.72 {
-            list.opaque.retain(|(m, _)| *m != crate::gfx::Mesh::GrassFar);
-        }
         if !self.hide_meshes.is_empty() {
             let hide = self.hide_meshes.clone();
             list.opaque.retain(|(m, _)| !hide.contains(&(*m as u8)));
         }
         // dynamic resolution: a phone that can't keep up renders the 3D a little softer. In a few steps,
         // and only once it's been slow (or fast) a while: every new size rebuilds all render targets
+        if !self.scale_lock {
+            self.render_scale = self.render_scale.min(self.save.settings.quality().max_scale);
+        }
+        #[cfg(target_os = "android")]
+        if self.fps_asked != Some(self.save.settings.max_fps) {
+            self.fps_asked = Some(self.save.settings.max_fps);
+            crate::android::max_fps(self.save.settings.max_fps);
+        }
         if self.time > 4.0 && !self.scale_lock {
             let fps = 1.0 / self.fps_dt.max(1e-4);
             let (slow, fast) = &mut self.scale_wait;
@@ -2101,18 +2110,22 @@ impl eframe::App for FlunkiApp {
                 *fast = 0.0;
             }
             let at = SCALE_STEPS.iter().rposition(|s| *s <= self.render_scale + 1e-3).unwrap_or(0);
+            let top = SCALE_STEPS.iter().rposition(|s| *s <= self.save.settings.quality().max_scale + 1e-3).unwrap_or(0);
             if *slow > 1.0 && at > 0 {
                 self.render_scale = SCALE_STEPS[at - 1];
                 // having had to go down, going back up waits longer
                 self.scale_up_after = self.time + 15.0;
                 self.scale_wait = (0.0, 0.0);
-            } else if *fast > 4.0 && at + 1 < SCALE_STEPS.len() && self.time > self.scale_up_after {
+            } else if *fast > 4.0 && at < top && self.time > self.scale_up_after {
                 self.render_scale = SCALE_STEPS[at + 1];
                 self.scale_wait = (0.0, 0.0);
             }
         }
+        // the park's lawn grows blades; a phone that's struggling gets fewer of them first
+        let q = self.save.settings.quality();
+        let grass = if shown.env_id() != ArenaKey::Vondel.id() || self.hide_meshes.contains(&15) { 0.0 } else { q.grass.min(if self.render_scale < 0.72 { 0.6 } else { 1.0 }) };
         let t_scene = now_ms();
-        let fd = Arc::new(FrameData { globals: self.globals(lk), list: list.clone(), clear: lk.clear, scale: self.render_scale });
+        let fd = Arc::new(FrameData { globals: self.globals(lk), list: list.clone(), clear: lk.clear, scale: self.render_scale, grass, leaves_far: q.leaves_far, shadows: q.shadows, bloom: q.bloom });
         self.frame_list = list;
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(full, SceneCallback(fd)));
         let painter = ui.painter().clone();
@@ -2160,6 +2173,8 @@ impl eframe::App for FlunkiApp {
         }
         self.last_nav = (self.screen, self.view, self.step, self.sheet);
         self.debug_cmds(sr);
+        #[cfg(not(target_arch = "wasm32"))]
+        shot(&ctx);
         SCREEN.with(|c| c.set(if self.screen == Screen::Home && self.view == View::Menu && self.sheet == Sheet::None { 0 } else { 1 }));
         ctx.request_repaint();
     }
@@ -2183,6 +2198,21 @@ thread_local! {
     /// 0 when the main menu is showing (the Android back button then leaves the app).
     pub static SCREEN: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
     pub static CMDS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// A screenshot asked for by `shot:path`.
+    static SHOT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn shot(ctx: &egui::Context) {
+    let Some(path) = SHOT.with(|s| s.borrow_mut().take()) else { return };
+    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(move |img| {
+        let mut out = format!("P6\n{} {}\n255\n", img.size[0], img.size[1]).into_bytes();
+        out.extend(img.pixels.iter().flat_map(|c| [c.r(), c.g(), c.b()]));
+        let _ = std::fs::write(&path, out);
+        log_str(&format!("shot {path}"));
+    })));
 }
 /// Test hook on the desktop: with FLUNKI_STDIN set, each line on stdin is a `flunki_cmd`.
 #[cfg(not(target_arch = "wasm32"))]
@@ -2387,8 +2417,12 @@ impl FlunkiApp {
                     self.scale_lock = true;
                     self.render_scale = arg.parse().unwrap_or(1.0);
                 }
+                "quality" => self.save.settings.quality = arg.parse::<u8>().unwrap_or(2).min(2),
                 "hide" => self.hide_meshes = arg.split(',').filter_map(|x| x.parse().ok()).collect(),
                 "fps" => log_str(&format!("fps {:.1}", 1.0 / self.fps_dt.max(1e-4))),
+                // the desktop: save what's on screen as a PPM picture
+                #[cfg(not(target_arch = "wasm32"))]
+                "shot" => SHOT.with(|s| *s.borrow_mut() = Some(arg.to_string())),
                 "state" => {
                     let n = self.net.as_ref().map(|n| format!("net(id={} host={} room={} members={:?} phase={} rtt={:.3} link={:?} pause={:?} skipped={} missed={} err={})", n.id, n.host(), n.code, n.members.iter().map(|m| (m.name.clone(), m.team, m.away)).collect::<Vec<_>>(), n.phase, n.rtt, n.link(self.game.pred.snap_age, self.game.mirror), self.game.net_pause, self.game.pred.skipped_snaps, self.game.pred.missed_ev, self.net_err)).unwrap_or_else(|| format!("nonet err={}", self.net_err));
                     log_str(&format!(

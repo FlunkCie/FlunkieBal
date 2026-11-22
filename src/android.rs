@@ -75,6 +75,13 @@ pub fn vibrate(ms: u32) {
         Ok(())
     });
 }
+/// Draw at the screen's highest refresh rate, or at 60 Hz (cooler, and plenty for this game).
+pub fn max_fps(on: bool) {
+    with(|env, a| {
+        env.call_method(a, "maxFps", "(Z)V", &[JValue::Bool(on as u8)])?;
+        Ok(())
+    });
+}
 /// The display cutout: top, right, bottom, left, in egui points.
 pub fn insets() -> [f32; 4] {
     with(|env, a| {

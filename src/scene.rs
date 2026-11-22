@@ -314,15 +314,7 @@ pub fn build_env() -> DrawList {
     // the pond
     dl.push(Mesh::Disc, t(20.0, 0.012, -22.0) * s(11.0, 1.0, 7.0), [0.10, 0.20, 0.22, 1.0], [kind::WATER, 0.0, 0.0, 0.0]);
     dl.push(Mesh::Disc, t(20.0, 0.008, -22.0) * s(11.6, 1.0, 7.6), [0.33, 0.29, 0.2, 1.0], [kind::LIT, 0.0, 0.0, 0.0]);
-    // the lawn grows real blades round the pitch (they shrink to nothing where it is worn)
-    for ix in -8i32..8 {
-        for iz in -8i32..8 {
-            let (x, z) = (2.0 + ix as f32 * 4.0, 2.0 + iz as f32 * 4.0);
-            let rot = ((ix * 7 + iz * 3).rem_euclid(4)) as f32 * PI * 0.5;
-            let near = x.abs() < 15.0 && z.abs() < 19.0;
-            dl.push(if near { Mesh::Grass } else { Mesh::GrassFar }, t(x, 0.0, z) * ry(rot), [1.0; 4], [kind::BLADE, 0.0, 0.0, 0.0]);
-        }
-    }
+    // (the blades growing on the lawn are made up on the GPU round the camera, see `gfx`)
     // trees, kept clear of the pitch and the paths
     let greens = [hex(0x2c5419), hex(0x3a6220), hex(0x284c1c), hex(0x456e24), hex(0x557024)];
     let mut placed = 0;

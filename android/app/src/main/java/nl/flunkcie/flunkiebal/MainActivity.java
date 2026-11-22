@@ -53,6 +53,7 @@ public class MainActivity extends NativeActivity {
         if (Build.VERSION.SDK_INT >= 28) {
             lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
         }
+        lp.preferredRefreshRate = refreshRate(false);
         w.setAttributes(lp);
         super.onCreate(state);
         hideSystemBars();
@@ -228,6 +229,25 @@ public class MainActivity extends NativeActivity {
             if (vibrator == null) vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
             Vibrator v = vibrator;
             if (v != null && v.hasVibrator()) v.vibrate(VibrationEffect.createOneShot(Math.max(1, ms), VibrationEffect.DEFAULT_AMPLITUDE));
+        });
+    }
+
+    /** A 90 or 120 Hz screen has the game draw every frame twice as often, and heats the phone for it:
+     *  60 Hz where the screen has it, unless the player asks for the most (graphics settings). */
+    private float refreshRate(boolean max) {
+        float best = 0f, sixty = 0f;
+        for (float hz : getWindowManager().getDefaultDisplay().getSupportedRefreshRates()) {
+            best = Math.max(best, hz);
+            if (Math.abs(hz - 60f) < 1f) sixty = hz;
+        }
+        return max || sixty == 0f ? best : sixty;
+    }
+
+    public void maxFps(boolean max) {
+        ui.post(() -> {
+            WindowManager.LayoutParams lp = getWindow().getAttributes();
+            lp.preferredRefreshRate = refreshRate(max);
+            getWindow().setAttributes(lp);
         });
     }
 

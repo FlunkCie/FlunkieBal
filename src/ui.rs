@@ -631,7 +631,7 @@ fn clubhouse(app: &mut FlunkiApp, ctx: &egui::Context, p: &egui::Painter, sr: Re
             let rows: [[(&str, &str, String, Option<Sheet>); 2]; 3] = [
                 [(TRAINING, "TRAINING", train, Some(Sheet::Train)), (STAR, "PROGRESS", progress, Some(Sheet::Progress))],
                 [(STATS, "STATS", stats, Some(Sheet::Stats)), (FRIENDS, "FRIENDS", friends_line(app), Some(Sheet::Friends))],
-                [(GEAR, "SETTINGS", "Sound, controls".into(), Some(Sheet::Settings)), (acc_icon, acc, acc_sub, if acc == "LOG OUT" { None } else { Some(Sheet::Account) })],
+                [(GEAR, "SETTINGS", "Sound, controls, graphics".into(), Some(Sheet::Settings)), (acc_icon, acc, acc_sub, if acc == "LOG OUT" { None } else { Some(Sheet::Account) })],
             ];
             for row in rows {
                 ui.horizontal(|ui| {
@@ -2332,6 +2332,28 @@ fn settings_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
         #[cfg(target_os = "android")]
         if toggle(ui, &mut s.notify, "Notify me of invites and messages", w) {
             dirty = true;
+        }
+        label_caps(ui, "Graphics");
+        ui.horizontal(|ui| {
+            let sw = (w - 2.0 * ui.spacing().item_spacing.x) / 3.0;
+            for (i, q) in crate::save::QUALITY.iter().enumerate() {
+                if seg(ui, q.name, s.quality as usize == i, false, sw).clicked() && s.quality as usize != i {
+                    s.quality = i as u8;
+                    dirty = true;
+                }
+            }
+        });
+        let q = s.quality();
+        let what = match (q.shadows, q.grass >= 1.0) {
+            (false, _) => "No shadows or glow, sparser grass, softer picture: for older phones and the longest battery",
+            (true, false) => "Shadows and glow, less grass, a little softer picture",
+            (true, true) => "Everything, at full sharpness; the picture softens by itself if the phone can't keep up",
+        };
+        ui.label(RichText::new(what).color(MUTED).size(13.0));
+        #[cfg(target_os = "android")]
+        {
+            dirty |= toggle(ui, &mut s.max_fps, "Smoothest motion (90/120 Hz screens)", w);
+            ui.label(RichText::new("Off: 60 frames a second, which keeps the phone cooler").color(MUTED).size(13.0));
         }
         {
             label_caps(ui, "Account");

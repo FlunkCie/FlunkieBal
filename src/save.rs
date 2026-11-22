@@ -67,10 +67,36 @@ pub struct Settings {
     pub voices: bool,
     /// notifications for invites and messages while the game isn't on screen
     pub notify: bool,
+    /// graphics: 0 low, 1 medium, 2 high (see `Quality`)
+    pub quality: u8,
+    /// Android: draw as often as the screen refreshes (90, 120 Hz) instead of at 60 Hz
+    pub max_fps: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
-        Settings { volume: 80, vibrate: true, sens: 1.0, trail: true, voices: true, notify: true }
+        Settings { volume: 80, vibrate: true, sens: 1.0, trail: true, voices: true, notify: true, quality: 2, max_fps: false }
+    }
+}
+/// What a graphics level draws.
+pub struct Quality {
+    pub name: &'static str,
+    pub shadows: bool,
+    pub bloom: bool,
+    /// how dense the park's grass grows
+    pub grass: f32,
+    /// leaf clumps further than this are drawn with fewer, bigger leaves
+    pub leaves_far: f32,
+    /// the highest 3D resolution (the dynamic resolution only goes down from here)
+    pub max_scale: f32,
+}
+pub const QUALITY: [Quality; 3] = [
+    Quality { name: "Low", shadows: false, bloom: false, grass: 0.45, leaves_far: 8.0, max_scale: 0.65 },
+    Quality { name: "Medium", shadows: true, bloom: true, grass: 0.7, leaves_far: 14.0, max_scale: 0.875 },
+    Quality { name: "High", shadows: true, bloom: true, grass: 1.0, leaves_far: 20.0, max_scale: 1.0 },
+];
+impl Settings {
+    pub fn quality(&self) -> &'static Quality {
+        &QUALITY[(self.quality as usize).min(QUALITY.len() - 1)]
     }
 }
 
