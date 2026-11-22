@@ -1,7 +1,7 @@
 //! The eframe app: state, input, camera, scene building, online glue. Screens live in `ui.rs`.
 
 use crate::arenas::{self, ArenaKey, Env};
-use crate::audio::Audio;
+use crate::audio::{Audio, Cue};
 use crate::game::{self, AMode, Drill, Foot, Game, Mode, Person, Sfx, StatEv, State, ThrowSpec};
 use crate::gfx::{DrawList, FrameData, Gfx, Globals, SceneCallback};
 use crate::model::Model;
@@ -117,6 +117,8 @@ pub struct FlunkiApp {
     pub(crate) game: Game,
     pub(crate) model: Arc<Model>,
     pub(crate) audio: Audio,
+    /// the sheet open last frame (a new one slides up with a swish)
+    last_sheet: Sheet,
     pub(crate) envs: HashMap<&'static str, Env>,
     pub(crate) save: Save,
     pub(crate) view: View,
@@ -315,6 +317,7 @@ impl FlunkiApp {
             notes_told: Default::default(),
             open_t: 0.0,
             bug_text: String::new(),
+            last_sheet: Sheet::None,
         };
         app.apply_volume();
         app
@@ -324,7 +327,7 @@ impl FlunkiApp {
         self.audio.volume = self.save.settings.volume as f32 / 100.0;
     }
     pub(crate) fn play(&mut self, s: Sfx) {
-        self.audio.play(s);
+        self.audio.game(s, &self.game);
         if self.save.settings.vibrate {
             match s {
                 Sfx::Hit => voice::vibrate(40),
@@ -355,6 +358,8 @@ impl FlunkiApp {
         self.last_xp = None;
         self.over_t = -1.0;
         self.cam_snap = true;
+        // cracking one open
+        self.audio.play(Cue::CanOpen, crate::audio::Play { gain: 0.45, ..Default::default() });
     }
     pub(crate) fn start_tutorial(&mut self) {
         self.audio.unlock();
@@ -995,6 +1000,7 @@ impl FlunkiApp {
             a.emote = i as u8 + 1;
             // a negative time is a wait: the pose only starts at 0
             a.emote_t = -0.25 * n as f32;
+            self.audio.emote(i, g.teams[t].players[p].pos, 0.25 * n as f32);
         }
         !free.is_empty()
     }
@@ -1024,7 +1030,7 @@ impl FlunkiApp {
             let (_, pitch, rate) = save::VOICES[voice_ix % 4];
             voice::speak(txt, lang, pitch, rate, self.audio.volume.max(0.05));
         } else {
-            self.play(Sfx::Touch(0.25));
+            crate::audio::ui(Cue::Pop);
         }
     }
 
@@ -1166,6 +1172,13 @@ impl FlunkiApp {
             self.save.matches.drain(..extra);
         }
         self.last_xp = Some(self.save.add_xp(n, parts));
+        self.level_sound(2.6);
+    }
+    /// Up a level: bells, once the results are on screen.
+    fn level_sound(&mut self, delay: f32) {
+        if self.last_xp.as_ref().map_or(false, |x| x.after.lv > x.before.lv) {
+            self.audio.play(Cue::LevelUp, crate::audio::Play { gain: 0.5, delay, ..Default::default() });
+        }
     }
     fn train_end(&mut self, k: Drill, v: f32, note: String) {
         let prev = self.save.train_pb[k.idx()];
@@ -1189,6 +1202,7 @@ impl FlunkiApp {
         }
         let parts = if rec { vec!["Drill 25".to_string(), "Record 25".to_string()] } else { vec!["Drill 25".to_string()] };
         self.last_xp = Some(self.save.add_xp(if rec { 50 } else { 25 }, parts));
+        self.level_sound(1.2);
         self.train_res = Some((k, v, note, rec, prev));
         self.save.store();
     }
@@ -1384,7 +1398,7 @@ impl FlunkiApp {
         if let Some((who, text)) = self.social.toast.take() {
             let short: String = text.chars().take(40).collect();
             self.banner = Some((game::Banner { title: who, sub: short, dur: 2.4, straf: false }, 0.0));
-            self.play(Sfx::Touch(0.3));
+            crate::audio::ui(Cue::Pop);
         }
     }
     /// The server's copy of our progression, just after logging in: take it, or keep ours if it's newer.
@@ -2030,6 +2044,15 @@ impl eframe::App for FlunkiApp {
         }
         let portrait = h > w;
         self.cam = Cam { pos: self.cam_pos, look: self.cam_look, fov: (if portrait { 66.0f32 } else { 50.0 }).to_radians(), aspect: w / h };
+        // what you hear is where the camera is, in the place on screen
+        let level = match self.screen {
+            Screen::Playing => 1.0,
+            Screen::Over | Screen::TrainOver => 0.8,
+            Screen::Paused => 0.5,
+            Screen::Home | Screen::Play => 0.6,
+        };
+        let shown = self.shown_arena();
+        self.audio.tick(dt, (self.cam_pos, self.cam_look), shown, level, &self.game);
 
         // the ball follows your finger while you aim
         let aiming = self.game.local_aiming() && self.screen == Screen::Playing;
@@ -2130,6 +2153,12 @@ impl eframe::App for FlunkiApp {
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(full, SceneCallback(fd)));
         let painter = ui.painter().clone();
         crate::ui::draw(self, &ctx, &painter, sr, full);
+        if self.sheet != self.last_sheet {
+            crate::audio::ui(if self.sheet == Sheet::None { Cue::SwishDown } else { Cue::SwishUp });
+            self.last_sheet = self.sheet;
+        }
+        let clicked = ctx.interaction_snapshot(|i| i.clicked.is_some());
+        self.audio.ui_frame(ctx.input(|i| i.stable_dt).min(0.1), clicked);
         let t_ui = now_ms();
         // a hitch, in words: which part of this frame took the time, or how long since the last one
         // (that gap is the GPU, texture uploads, the browser). Shows in the console and in logcat

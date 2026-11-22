@@ -7,6 +7,7 @@ use crate::icons::*;
 use crate::game::{self, Ctrl, Drill, Foot, Mode, State, Tut};
 use crate::save::{self, Unlock, XpResult};
 use crate::voice;
+use crate::audio::{self, Cue};
 use egui::{pos2, vec2, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui};
 use std::sync::Arc;
 
@@ -147,6 +148,9 @@ fn sheet_head(ui: &mut Ui, title: &str) -> bool {
                 p.line_segment([c + a, c + b], Stroke::new(2.0, Color32::WHITE));
             }
             close = resp.clicked();
+            if close {
+                audio::ui(Cue::Back);
+            }
         });
     });
     close
@@ -156,6 +160,7 @@ fn toggle(ui: &mut Ui, on: &mut bool, label: &str, w: f32) -> bool {
     let (r, resp) = ui.allocate_exact_size(vec2(w, 44.0), Sense::click());
     if resp.clicked() {
         *on = !*on;
+        audio::ui(if *on { Cue::ToggleOn } else { Cue::ToggleOff });
     }
     let p = ui.painter();
     p.text(r.left_center(), Align2::LEFT_CENTER, label, FontId::proportional(17.0), Color32::WHITE);
@@ -199,7 +204,11 @@ fn panel() -> egui::Frame {
 }
 fn big(ui: &mut Ui, text: &str, primary: bool, width: f32) -> egui::Response {
     let rt = RichText::new(text).font(anton(21.0)).color(if primary { INK } else { Color32::WHITE });
-    ui.add(egui::Button::new(rt).fill(if primary { GOLD } else { Color32::from_white_alpha(22) }).corner_radius(CornerRadius::same(14)).min_size(vec2(width, 52.0)))
+    let r = ui.add(egui::Button::new(rt).fill(if primary { GOLD } else { Color32::from_white_alpha(22) }).corner_radius(CornerRadius::same(14)).min_size(vec2(width, 52.0)));
+    if r.clicked() {
+        audio::ui(if primary { Cue::TapBig } else { Cue::Tap });
+    }
+    r
 }
 fn small_btn(ui: &mut Ui, text: &str) -> egui::Response {
     ui.add(egui::Button::new(RichText::new(text).size(15.0)).fill(Color32::from_white_alpha(18)).corner_radius(CornerRadius::same(10)))
@@ -207,7 +216,11 @@ fn small_btn(ui: &mut Ui, text: &str) -> egui::Response {
 fn seg(ui: &mut Ui, text: &str, sel: bool, locked: bool, w: f32) -> egui::Response {
     let label = if locked && !sel { format!("{LOCK} {text}") } else { text.to_string() };
     let rt = RichText::new(label).size(15.0).color(if sel { INK } else if locked { Color32::from_white_alpha(110) } else { Color32::WHITE });
-    ui.add(egui::Button::new(rt).fill(if sel { Color32::from_rgb(0xff, 0xe0, 0x8a) } else { Color32::from_white_alpha(16) }).corner_radius(CornerRadius::same(10)).min_size(vec2(w, 36.0)))
+    let r = ui.add(egui::Button::new(rt).fill(if sel { Color32::from_rgb(0xff, 0xe0, 0x8a) } else { Color32::from_white_alpha(16) }).corner_radius(CornerRadius::same(10)).min_size(vec2(w, 36.0)));
+    if r.clicked() {
+        audio::ui(if locked && !sel { Cue::Denied } else { Cue::Tick });
+    }
+    r
 }
 /// A card-style button with a title and a line under it.
 fn card_btn(ui: &mut Ui, title: &str, sub: &str, w: f32, accent: Color32) -> egui::Response {
@@ -237,6 +250,9 @@ fn swatch(ui: &mut Ui, c: u32, sel: bool, locked: bool) -> egui::Response {
     }
     if locked && !sel {
         p.text(r.center(), Align2::CENTER_CENTER, LOCK, FontId::proportional(13.0), Color32::WHITE);
+    }
+    if resp.clicked() {
+        audio::ui(if locked && !sel { Cue::Denied } else { Cue::Tick });
     }
     resp
 }
@@ -527,6 +543,9 @@ fn brand_pill(ctx: &egui::Context, sr: Rect, text: &str, back: bool) -> bool {
         }
         p.galley(pos2(r.left() + 44.0, r.center().y - gal.size().y / 2.0), gal, GOLD);
         clicked = resp.clicked();
+        if clicked {
+            audio::ui(Cue::Back);
+        }
     });
     clicked
 }
@@ -684,6 +703,7 @@ fn arena_picker(app: &mut FlunkiApp, ui: &mut Ui, w: f32) {
                 p.text(r.left_top() + vec2(12.0, 31.0), Align2::LEFT_TOP, if locked { format!("{LOCK} Level {need}") } else { k.blurb().chars().take(30).collect::<String>() }, FontId::proportional(12.0), if locked { WARN } else { MUTED });
                 if resp.clicked() {
                     if locked {
+                        audio::ui(Cue::Denied);
                         app.lock_note = Some((format!("{LOCK} {} unlocks at level {need} · you are level {}", k.name(), app.save.level()), 2.6));
                     } else {
                         app.arena = k;
@@ -2210,6 +2230,7 @@ fn profile_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
             }
         });
         if let Some((what, need)) = note {
+            audio::ui(Cue::Denied);
             app.lock_note = Some((format!("{LOCK} That {what} unlocks at level {need} · you are level {lv}"), 2.6));
         }
         if changed {
@@ -2304,6 +2325,10 @@ fn settings_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
         let mut dirty = false;
         let mut vol = s.volume as f32;
         if slider_row(ui, "Volume", &mut vol, 0.0, 100.0, |v| format!("{}%", v.round()), w) {
+            // a tap at the new level, to hear it by
+            if vol.round() as u32 / 5 != s.volume / 5 {
+                audio::ui(Cue::Tap);
+            }
             s.volume = vol.round() as u32;
             dirty = true;
         }

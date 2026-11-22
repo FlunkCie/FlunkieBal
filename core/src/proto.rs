@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL: u32 = 11;
 /// This build of the game. Bumped with every release (the APK's versionCode is read from here, see
 /// `android/app/build.gradle`); the server says which is the latest (`Latest`), so an old app can tell.
-pub const APP_BUILD: u32 = 11;
+pub const APP_BUILD: u32 = 12;
 /// Where the newest APK is.
 pub const APK_URL: &str = "https://flunkcie.nl/downloads/flunkiebal.apk";
 pub const SNAP_HZ: f32 = 20.0;

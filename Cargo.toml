@@ -44,7 +44,7 @@ ndk = { version = "0.9", features = ["audio", "api-level-26"] }
 wgpu = { version = "30", default-features = false, features = ["webgl", "webgpu", "wgsl"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Window","Document","HtmlCanvasElement","Element","Storage","AudioContext","AudioContextState","OscillatorNode","GainNode","AudioParam","AudioDestinationNode","AudioNode","AudioBuffer","AudioBufferSourceNode","BiquadFilterNode","BiquadFilterType","OscillatorType","AudioScheduledSourceNode","BaseAudioContext","Performance","console","SpeechSynthesis","SpeechSynthesisUtterance","SpeechSynthesisVoice","Navigator","WebSocket","MessageEvent","CloseEvent","BinaryType"] }
+web-sys = { version = "0.3", features = ["Window","Document","HtmlCanvasElement","Element","Storage","AudioContext","AudioContextState","OscillatorNode","GainNode","AudioParam","AudioDestinationNode","AudioNode","AudioBuffer","AudioBufferSourceNode","BiquadFilterNode","BiquadFilterType","OscillatorType","AudioScheduledSourceNode","StereoPannerNode","ConvolverNode","DynamicsCompressorNode","EventTarget","BaseAudioContext","Performance","console","SpeechSynthesis","SpeechSynthesisUtterance","SpeechSynthesisVoice","Navigator","WebSocket","MessageEvent","CloseEvent","BinaryType"] }
 console_error_panic_hook = "0.1"
 js-sys = "0.3"
 

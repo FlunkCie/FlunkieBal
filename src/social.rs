@@ -258,7 +258,10 @@ impl Social {
                         c.push(m);
                     }
                 }
-                FromServer::Invited { code, name, room } => self.invite = Some(Invite { code, name, room, at: now }),
+                FromServer::Invited { code, name, room } => {
+                    crate::audio::ui(crate::audio::Cue::Chime);
+                    self.invite = Some(Invite { code, name, room, at: now });
+                }
                 FromServer::Note { note } => self.notes.push(note),
                 FromServer::Latest { build } => self.latest = build,
                 FromServer::BugSaved { ok, msg } => {
