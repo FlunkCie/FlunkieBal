@@ -2,10 +2,12 @@
 pub use flunkiebal_core::{anim, game, icons};
 pub mod app;
 pub mod arenas;
+pub mod body;
 pub mod audio;
 pub mod chalk;
 pub mod gfx;
 pub mod model;
+pub mod nature;
 pub mod net;
 pub mod voice;
 pub mod save;

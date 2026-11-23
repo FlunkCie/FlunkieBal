@@ -83,23 +83,41 @@ pub mod kind {
     pub const BEAM: f32 = 18.0;
 }
 
-/// One skinned person: joint matrices (world), material colours, referee stripes.
+/// An RGBA picture at half the size (a box filter, in sRGB: close enough for mipmaps).
+fn half(px: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let (w2, h2) = ((w / 2).max(1), (h / 2).max(1));
+    let mut out = vec![0u8; w2 * h2 * 4];
+    for y in 0..h2 {
+        for x in 0..w2 {
+            for c in 0..4 {
+                let at = |xx: usize, yy: usize| px[((yy.min(h - 1)) * w + xx.min(w - 1)) * 4 + c] as u32;
+                out[(y * w2 + x) * 4 + c] = ((at(x * 2, y * 2) + at(x * 2 + 1, y * 2) + at(x * 2, y * 2 + 1) + at(x * 2 + 1, y * 2 + 1) + 2) / 4) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// One skinned person: joint matrices (world), the colours vertices can take (0 shirt, 1 skin, 5 hair, see
+/// `model::SkinVertex`), referee stripes, and the index ranges (first, count) of their meshes in
+/// `Model::indices`.
 #[derive(Clone)]
 pub struct SkinDraw {
     pub bones: Vec<Mat4>,
-    pub colors: [[f32; 4]; 6],
+    pub colors: [[f32; 4]; 8],
     pub stripe: f32,
+    pub parts: Vec<(u32, u32)>,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SkinUniform {
     bones: [[[f32; 4]; 4]; MAX_BONES],
-    colors: [[f32; 4]; 6],
+    colors: [[f32; 4]; 8],
     misc: [f32; 4],
 }
 pub const MAX_BONES: usize = 32;
-const SKIN_STRIDE: u64 = 2304; // SkinUniform (2160 bytes) rounded up to 256
+const SKIN_STRIDE: u64 = 2304; // SkinUniform (2192 bytes) rounded up to 256
 const MAX_SKINS: usize = 24;
 
 #[derive(Default, Clone)]
@@ -108,9 +126,13 @@ pub struct DrawList {
     pub blend: Vec<(Mesh, Inst)>,
     pub add: Vec<(Mesh, Inst)>,
     pub skinned: Vec<SkinDraw>,
+    /// the park's plants and stones, by their number in `nature::MODELS`. params: y = drawn up to this far
+    /// from the camera (0: always), z = casts a shadow (like the others)
+    pub nature: Vec<(u16, Inst)>,
 }
 impl DrawList {
     pub fn clear(&mut self) {
+        self.nature.clear();
         self.opaque.clear();
         self.blend.clear();
         self.add.clear();
@@ -345,6 +367,17 @@ const GRASS_FAR: f32 = 30.0;
 /// Where each blade shape starts in the grass index buffer, and its indices per blade.
 const GRASS_SHAPES: [(u32, u32); 3] = [(0, 15), (GRASS_NB * 15, 9), (GRASS_NB * 24, 3)];
 
+/// One of the meshes on its own: positions, normals, triangles (for tools: `scene::dump_hats`).
+#[cfg(test)]
+pub(crate) fn mesh_geometry(m: Mesh) -> (Vec<Vec3>, Vec<Vec3>, Vec<u32>) {
+    let b = build_meshes();
+    let (first, count, _) = b.ranges[m as usize];
+    let idx = &b.i[first as usize..(first + count) as usize];
+    let lo = *idx.iter().min().unwrap_or(&0);
+    let hi = *idx.iter().max().unwrap_or(&0);
+    let v = &b.v[lo as usize..=hi as usize];
+    (v.iter().map(|x| Vec3::from(x.pos)).collect(), v.iter().map(|x| Vec3::from(x.nrm)).collect(), idx.iter().map(|i| i - lo).collect())
+}
 fn build_meshes() -> MeshBuf {
     let mut b = MeshBuf { v: Vec::new(), i: Vec::new(), ranges: [(0, 0, 0); MESH_COUNT], bounds: [(Vec3::ZERO, 0.0); MESH_COUNT] };
     let (v, i) = cube();
@@ -420,10 +453,16 @@ pub struct Gfx {
     targets: Option<Targets>,
     skin_v: wgpu::Buffer,
     skin_i: wgpu::Buffer,
-    skin_n: u32,
     skin_buf: wgpu::Buffer,
     skin_bg: wgpu::BindGroup,
     p_skin: wgpu::RenderPipeline,
+    nat_v: wgpu::Buffer,
+    nat_i: wgpu::Buffer,
+    nat_ranges: Vec<(u32, u32)>,
+    nat_bounds: Vec<(Vec3, f32)>,
+    nat_bg: wgpu::BindGroup,
+    p_nature: wgpu::RenderPipeline,
+    p_nature_shadow: wgpu::RenderPipeline,
     p_skin_shadow: wgpu::RenderPipeline,
     p_grass: wgpu::RenderPipeline,
     grass_ibuf: wgpu::Buffer,
@@ -517,7 +556,7 @@ fn vertex_layouts() -> [wgpu::VertexBufferLayout<'static>; 2] {
 }
 
 impl Gfx {
-    pub fn new(rs: &egui_wgpu::RenderState, model: &crate::model::Model) -> Self {
+    pub fn new(rs: &egui_wgpu::RenderState, model: &crate::model::Model, nature: &crate::nature::Nature) -> Self {
         let device = &rs.device;
         let hf = rs.adapter.get_texture_format_features(HDR_FMT);
         let hdr = hf.allowed_usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING) && hf.flags.contains(wgpu::TextureFormatFeatureFlags::FILTERABLE) && hf.flags.contains(wgpu::TextureFormatFeatureFlags::BLENDABLE);
@@ -637,16 +676,54 @@ impl Gfx {
         let skin_v = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("skin v"), contents: bytemuck::cast_slice(&model.verts), usage: wgpu::BufferUsages::VERTEX });
         let skin_i = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("skin i"), contents: bytemuck::cast_slice(&model.indices), usage: wgpu::BufferUsages::INDEX });
         let skin_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("skin u"), size: SKIN_STRIDE * MAX_SKINS as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        // their clothes, skin and hair: one texture, mipmapped here
+        let (aw, ah) = (model.atlas.0, model.atlas.1);
+        let mips = aw.min(ah).ilog2() + 1;
+        let atlas = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("people"),
+            size: wgpu::Extent3d { width: aw, height: ah, depth_or_array_layers: 1 },
+            mip_level_count: mips,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut level = model.atlas.2.clone();
+        let (mut w, mut h) = (aw, ah);
+        for mip in 0..mips {
+            rs.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &atlas, mip_level: mip, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                &level,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            if mip + 1 < mips {
+                level = half(&level, w as usize, h as usize);
+                w /= 2;
+                h /= 2;
+            }
+        }
+        let atlas_view = atlas.create_view(&Default::default());
+        let atlas_smp = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("people smp"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, mipmap_filter: wgpu::MipmapFilterMode::Linear, anisotropy_clamp: 4, ..Default::default() });
         let skin_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("skin bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<SkinUniform>() as u64) }, count: None }],
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<SkinUniform>() as u64) }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
         });
         let skin_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("skin bg"),
             layout: &skin_bgl,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &skin_buf, offset: 0, size: wgpu::BufferSize::new(std::mem::size_of::<SkinUniform>() as u64) }) }],
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &skin_buf, offset: 0, size: wgpu::BufferSize::new(std::mem::size_of::<SkinUniform>() as u64) }) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&atlas_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&atlas_smp) },
+            ],
         });
-        const SA: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4, 4 => Float32];
+        const SA: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x4, 4 => Float32x2, 5 => Float32];
         let skin_layout = [Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<crate::model::SkinVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &SA })];
         let skin_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("skin pl"), bind_group_layouts: &[Some(&scene_bgl), Some(&skin_bgl)], immediate_size: 0 });
         let skin_shadow_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("skin shadow pl"), bind_group_layouts: &[Some(&shadow_bgl), Some(&skin_bgl)], immediate_size: 0 });
@@ -654,10 +731,11 @@ impl Gfx {
             label: Some("skin"),
             layout: Some(&skin_pl),
             vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_skin"), compilation_options: Default::default(), buffers: &skin_layout },
+            // its own fragment entry: people are shaded a little differently (see `fs_person`)
             primitive: prim,
             depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH_FMT, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::GreaterEqual), stencil: Default::default(), bias: Default::default() }),
             multisample: wgpu::MultisampleState { count: msaa, ..Default::default() },
-            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_main"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: color_fmt, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_person"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: color_fmt, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
             multiview_mask: None,
             cache: None,
         });
@@ -669,6 +747,78 @@ impl Gfx {
             depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH_FMT, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::LessEqual), stencil: Default::default(), bias: wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 } }),
             multisample: Default::default(),
             fragment: None,
+            multiview_mask: None,
+            cache: None,
+        });
+        // ---- the park's plants and stones (`nature`): their own vertices, a texture layer each ----
+        let nat_v = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("nature v"), contents: bytemuck::cast_slice(&nature.verts), usage: wgpu::BufferUsages::VERTEX });
+        let nat_i = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("nature i"), contents: bytemuck::cast_slice(&nature.indices), usage: wgpu::BufferUsages::INDEX });
+        let (ns, nl) = (nature.tex.0, nature.tex.1);
+        let nmips = ns.ilog2() + 1;
+        let nat_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("nature"),
+            size: wgpu::Extent3d { width: ns, height: ns, depth_or_array_layers: nl },
+            mip_level_count: nmips,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let layer_bytes = (ns * ns * 4) as usize;
+        for l in 0..nl {
+            let mut level = nature.tex.2[l as usize * layer_bytes..(l as usize + 1) * layer_bytes].to_vec();
+            let mut w = ns;
+            for mip in 0..nmips {
+                rs.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo { texture: &nat_tex, mip_level: mip, origin: wgpu::Origin3d { x: 0, y: 0, z: l }, aspect: wgpu::TextureAspect::All },
+                    &level,
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(w) },
+                    wgpu::Extent3d { width: w, height: w, depth_or_array_layers: 1 },
+                );
+                if mip + 1 < nmips {
+                    level = half(&level, w as usize, w as usize);
+                    w /= 2;
+                }
+            }
+        }
+        let nat_view = nat_tex.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        let nat_smp = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("nature smp"), address_mode_u: wgpu::AddressMode::Repeat, address_mode_v: wgpu::AddressMode::Repeat, mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, mipmap_filter: wgpu::MipmapFilterMode::Linear, anisotropy_clamp: 4, ..Default::default() });
+        let nat_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("nature bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
+        });
+        let nat_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("nature bg"),
+            layout: &nat_bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&nat_view) }, wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&nat_smp) }],
+        });
+        const NA: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 9 => Float32x3, 10 => Float32x2];
+        let nat_layout = [Some(wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<crate::nature::NVertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &NA }), Some(layouts[1].clone())];
+        let nat_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("nature pl"), bind_group_layouts: &[Some(&scene_bgl), Some(&nat_bgl)], immediate_size: 0 });
+        let nat_shadow_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("nature shadow pl"), bind_group_layouts: &[Some(&shadow_bgl), Some(&nat_bgl)], immediate_size: 0 });
+        let p_nature = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("nature"),
+            layout: Some(&nat_pl),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_nature"), compilation_options: Default::default(), buffers: &nat_layout },
+            primitive: prim,
+            depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH_FMT, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::GreaterEqual), stencil: Default::default(), bias: Default::default() }),
+            multisample: wgpu::MultisampleState { count: msaa, ..Default::default() },
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_nature"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: color_fmt, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let p_nature_shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("nature shadow"),
+            layout: Some(&nat_shadow_pl),
+            vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_nature_shadow"), compilation_options: Default::default(), buffers: &nat_layout },
+            primitive: prim,
+            depth_stencil: Some(wgpu::DepthStencilState { format: DEPTH_FMT, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::LessEqual), stencil: Default::default(), bias: wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 } }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_nature_shadow"), compilation_options: Default::default(), targets: &[] }),
             multiview_mask: None,
             cache: None,
         });
@@ -721,7 +871,7 @@ impl Gfx {
         let encode = if rs.target_format.is_srgb() { 0.0f32 } else { 1.0 };
         let blit_cfg = device.create_buffer(&wgpu::BufferDescriptor { label: Some("blit cfg"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         log::info!("renderer ready: {:?}, msaa {msaa}, hdr {hdr}, target {:?}", rs.adapter.get_info().backend, rs.target_format);
-        Gfx { vbuf, ibuf, ranges: mb.ranges, bounds: mb.bounds, inst_buf, inst_cap, globals_buf, shadow_globals_buf, scene_bg, shadow_bg, shadow_view, p_opaque, p_mat, p_blend, p_add, p_shadow, p_blit, p_bright, p_down, p_up, bloom_bgl, hdr, color_fmt, encode, blit_bgl, blit_smp, blit_cfg, msaa, targets: None, skin_n: model.indices.len() as u32, skin_v, skin_i, skin_buf, skin_bg, p_skin, p_skin_shadow, p_grass, grass_ibuf, timer: GpuTimer::new(device, &rs.queue) }
+        Gfx { vbuf, ibuf, ranges: mb.ranges, bounds: mb.bounds, inst_buf, inst_cap, globals_buf, shadow_globals_buf, scene_bg, shadow_bg, shadow_view, p_opaque, p_mat, p_blend, p_add, p_shadow, p_blit, p_bright, p_down, p_up, bloom_bgl, hdr, color_fmt, encode, blit_bgl, blit_smp, blit_cfg, msaa, targets: None, skin_v, skin_i, skin_buf, skin_bg, p_skin, p_skin_shadow, nat_v, nat_i, nat_ranges: nature.ranges.clone(), nat_bounds: nature.bounds.clone(), nat_bg, p_nature, p_nature_shadow, p_grass, grass_ibuf, timer: GpuTimer::new(device, &rs.queue) }
     }
 
     fn ensure_targets(&mut self, device: &wgpu::Device, size: [u32; 2]) {
@@ -780,6 +930,22 @@ impl Gfx {
         });
         let texs = texs.into_inner();
         self.targets = Some(Targets { size, color_ms, resolved, depth, blit_bg, bloom, resolved_bg, texs });
+    }
+
+    /// The park's plants and stones of one pass (0 shadow, 1 scene); bind group 0 is set already.
+    fn draw_nature(&self, rp: &mut wgpu::RenderPass<'_>, runs: &[(u8, u16, u32, u32)], pass: u8) {
+        if !runs.iter().any(|r| r.0 == pass) {
+            return;
+        }
+        rp.set_pipeline(if pass == 0 { &self.p_nature_shadow } else { &self.p_nature });
+        rp.set_bind_group(1, &self.nat_bg, &[]);
+        rp.set_vertex_buffer(0, self.nat_v.slice(..));
+        rp.set_vertex_buffer(1, self.inst_buf.slice(..));
+        rp.set_index_buffer(self.nat_i.slice(..), wgpu::IndexFormat::Uint32);
+        for &(_, id, first, n) in runs.iter().filter(|r| r.0 == pass) {
+            let (i0, count) = self.nat_ranges[id as usize];
+            rp.draw_indexed(i0..i0 + count, 0, first..first + n);
+        }
     }
 
     fn render(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, enc: &mut wgpu::CommandEncoder, size: [u32; 2], f: &FrameData) {
@@ -847,6 +1013,39 @@ impl Gfx {
                 push(3, 0, *m, i, &mut all, &mut runs);
             }
         }
+        // the park's plants and stones: what's in view and not too far, sorted by model
+        let mut ncast: Vec<(u16, &Inst)> = Vec::new();
+        let mut nview: Vec<(u16, &Inst)> = Vec::new();
+        for (id, i) in &f.list.nature {
+            let Some(&(c, r)) = self.nat_bounds.get(*id as usize) else { continue };
+            let mm = Mat4::from_cols_array_2d(&i.m);
+            let k = mm.x_axis.truncate().length().max(mm.y_axis.truncate().length()).max(mm.z_axis.truncate().length());
+            // what the wind moves goes a little outside its mesh
+            let (c, r) = (mm.transform_point3(c), r * k * 1.05 + 0.1);
+            if i.params[1] > 0.0 && c.distance(cam) - r > i.params[1] {
+                continue;
+            }
+            if f.shadows && i.params[2] >= 0.5 && light_fr.sees(c, r) {
+                ncast.push((*id, i));
+            }
+            if cam_fr.sees(c, r) {
+                nview.push((*id, i));
+            }
+        }
+        ncast.sort_by_key(|x| x.0);
+        nview.sort_by_key(|x| x.0);
+        // pass (0 shadow, 1 scene), model, first instance, instances
+        let mut nruns: Vec<(u8, u16, u32, u32)> = Vec::new();
+        for (pass, list) in [(0u8, &ncast), (1, &nview)] {
+            for (id, i) in list.iter() {
+                let idx = all.len() as u32;
+                all.push(**i);
+                match nruns.last_mut() {
+                    Some(last) if last.0 == pass && last.1 == *id && last.2 + last.3 == idx => last.3 += 1,
+                    _ => nruns.push((pass, *id, idx, 1)),
+                }
+            }
+        }
         // grass: the tiles round the camera that it can see, nearest first, so blades hide those behind
         // them before they're shaded. Further tiles get fewer blades and simpler ones
         let mut grass_runs: Vec<(u32, u32, u32, u32)> = Vec::new(); // first index, indices, first instance, instances
@@ -901,6 +1100,7 @@ impl Gfx {
         let b = gl.misc[2];
         queue.write_buffer(&self.blit_cfg, 0, bytemuck::cast_slice(&[self.encode, if self.hdr { 1.0 } else { 0.0 }, if f.bloom { 0.05 } else { 0.0 }, 0.0, b, gl.grade[0], gl.grade[1], gl.grade[2]]));
         let nskin = f.list.skinned.len().min(MAX_SKINS);
+
         for (k, sd) in f.list.skinned.iter().take(nskin).enumerate() {
             let mut u = SkinUniform { bones: [[[0.0; 4]; 4]; MAX_BONES], colors: sd.colors, misc: [sd.stripe, 0.0, 0.0, 0.0] };
             for (b, m) in sd.bones.iter().take(MAX_BONES).enumerate() {
@@ -943,10 +1143,13 @@ impl Gfx {
             rp.set_pipeline(&self.p_skin_shadow);
             rp.set_vertex_buffer(0, self.skin_v.slice(..));
             rp.set_index_buffer(self.skin_i.slice(..), wgpu::IndexFormat::Uint32);
-            for k in 0..nskin {
+            for (k, sd) in f.list.skinned.iter().take(nskin).enumerate() {
                 rp.set_bind_group(1, &self.skin_bg, &[(k as u64 * SKIN_STRIDE) as u32]);
-                rp.draw_indexed(0..self.skin_n, 0, 0..1);
+                for &(first, n) in sd.parts.iter().filter(|p| p.1 > 0) {
+                    rp.draw_indexed(first..first + n, 0, 0..1);
+                }
             }
+            self.draw_nature(&mut rp, &nruns, 0);
         }
         // 2) the scene
         let t = self.targets.as_ref().unwrap();
@@ -975,6 +1178,13 @@ impl Gfx {
         rp.set_vertex_buffer(1, self.inst_buf.slice(..));
         rp.set_index_buffer(self.ibuf.slice(..), wgpu::IndexFormat::Uint32);
         draw(&mut rp, &self.ranges, 1, Some((&self.p_opaque, &self.p_mat)));
+        if nruns.iter().any(|r| r.0 == 1) {
+            rp.set_bind_group(0, &self.scene_bg, &[]);
+            self.draw_nature(&mut rp, &nruns, 1);
+            rp.set_vertex_buffer(0, self.vbuf.slice(..));
+            rp.set_vertex_buffer(1, self.inst_buf.slice(..));
+            rp.set_index_buffer(self.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+        }
         if !grass_runs.is_empty() {
             rp.set_pipeline(&self.p_grass);
             rp.set_vertex_buffer(0, self.inst_buf.slice(..));
@@ -990,9 +1200,11 @@ impl Gfx {
         rp.set_pipeline(&self.p_skin);
         rp.set_vertex_buffer(0, self.skin_v.slice(..));
         rp.set_index_buffer(self.skin_i.slice(..), wgpu::IndexFormat::Uint32);
-        for k in 0..nskin {
+        for (k, sd) in f.list.skinned.iter().take(nskin).enumerate() {
             rp.set_bind_group(1, &self.skin_bg, &[(k as u64 * SKIN_STRIDE) as u32]);
-            rp.draw_indexed(0..self.skin_n, 0, 0..1);
+            for &(first, n) in sd.parts.iter().filter(|p| p.1 > 0) {
+                rp.draw_indexed(first..first + n, 0, 0..1);
+            }
         }
         rp.set_vertex_buffer(0, self.vbuf.slice(..));
         rp.set_vertex_buffer(1, self.inst_buf.slice(..));

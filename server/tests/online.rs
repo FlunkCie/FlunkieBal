@@ -129,13 +129,18 @@ impl Bot {
         Input::Throw { o: o.to_array(), yaw: (-o.x).atan2(-o.z), dist: (o.x * o.x + o.z * o.z).sqrt() - 0.3, curve: 0.0, ring: 2 }
     }
 }
+/// An account to play online with: (friend code, secret).
+async fn creds(url: &str, name: &str) -> (String, String) {
+    let p = Pal::login(url, "", "", name).await;
+    (p.code, p.secret)
+}
 async fn pair(s: &Server) -> (Bot, Bot) {
     let look = [0u8; 7];
     let mut a = Bot::new(&s.url).await;
-    a.send(ToServer::Host { v: PROTOCOL, name: "Anna".into(), look, me: Default::default() }).await;
+    a.send(ToServer::Host { v: PROTOCOL, name: "Anna".into(), look, me: creds(&s.url, "Anna").await, wear: [0; 8] }).await;
     a.run(0.2).await;
     let mut b = Bot::new(&s.url).await;
-    b.send(ToServer::Join { v: PROTOCOL, code: a.code.clone(), name: "Bram".into(), look, me: Default::default() }).await;
+    b.send(ToServer::Join { v: PROTOCOL, code: a.code.clone(), name: "Bram".into(), look, me: creds(&s.url, "Bram").await, wear: [0; 8] }).await;
     b.run(0.2).await;
     a.run(0.1).await;
     assert_eq!(a.members.len(), 2);
@@ -194,7 +199,7 @@ async fn whole_match_with_bots() {
     let _ = Foot::L;
     // someone joining between matches gets the lobby, not the finished match
     let mut c = Bot::new(&s.url).await;
-    c.send(ToServer::Join { v: PROTOCOL, code: a.code.clone(), name: "Cato".into(), look: [0; 7], me: Default::default() }).await;
+    c.send(ToServer::Join { v: PROTOCOL, code: a.code.clone(), name: "Cato".into(), look: [0; 7], me: creds(&s.url, "Cato").await, wear: [0; 8] }).await;
     c.run(0.4).await;
     assert!(c.err.is_none(), "{:?}", c.err);
     assert_eq!(c.g.pred.last_q, 0, "no snapshots for them yet");
@@ -293,7 +298,7 @@ async fn bad_requests_are_told() {
     let (mut a, mut b) = pair(&s).await;
     // an old game
     let mut old = Bot::new(&s.url).await;
-    old.send(ToServer::Host { v: 1, name: "Old".into(), look: [0; 7], me: Default::default() }).await;
+    old.send(ToServer::Host { v: 1, name: "Old".into(), look: [0; 7], me: Default::default(), wear: [0; 8] }).await;
     old.run(0.2).await;
     assert!(old.err.as_deref().is_some_and(|e| e.contains("out of date")), "{:?}", old.err);
     assert!(s.logged("has protocol 1"));
@@ -311,7 +316,7 @@ async fn bad_requests_are_told() {
     a.run(0.2).await;
     b.run(0.2).await;
     let mut late = Bot::new(&s.url).await;
-    late.send(ToServer::Join { v: PROTOCOL, code: a.code.clone(), name: "Late".into(), look: [0; 7], me: Default::default() }).await;
+    late.send(ToServer::Join { v: PROTOCOL, code: a.code.clone(), name: "Late".into(), look: [0; 7], me: creds(&s.url, "Late").await, wear: [0; 8] }).await;
     late.run(0.2).await;
     assert!(late.err.as_deref().is_some_and(|e| e.contains("already started")));
     let thrower = if a.g.local_aiming() { &mut a } else { &mut b };
@@ -347,17 +352,28 @@ struct Pal {
     auth_err: Option<String>,
     notes: Vec<Note>,
     latest: Option<u32>,
+    coins: Option<u32>,
+    owned: Vec<u8>,
+    gains: Vec<(i64, String)>,
+    board: Option<(u8, Vec<BoardRow>, Option<BoardRow>)>,
 }
 impl Pal {
+    /// Log in with a kept session, or with no code, sign up as `name` (without its spaces).
     async fn login(url: &str, code: &str, secret: &str, name: &str) -> Pal {
         let mut p = Pal::open(url).await;
-        p.send(ToServer::SHello { v: PROTOCOL, code: code.into(), secret: secret.into(), name: name.into(), only: false }).await;
-        p.run().await;
+        if code.is_empty() {
+            let user: String = name.chars().filter(|c| !c.is_whitespace()).collect();
+            p.auth(ToServer::Register { v: PROTOCOL, user, pass: "longenough".into(), name: name.into() }).await;
+            p.run().await;
+        } else {
+            p.send(ToServer::SHello { v: PROTOCOL, code: code.into(), secret: secret.into(), name: name.into(), only: true }).await;
+            p.run().await;
+        }
         assert!(!p.code.is_empty(), "no account: {:?}", p.err);
         p
     }
     async fn open(url: &str) -> Pal {
-        Pal { ws: open(url).await, code: String::new(), secret: String::new(), friends: vec![], requests: vec![], sent: vec![], said: vec![], history: vec![], invites: vec![], err: None, user: String::new(), name: String::new(), progress: None, auth_err: None, notes: vec![], latest: None }
+        Pal { ws: open(url).await, code: String::new(), secret: String::new(), friends: vec![], requests: vec![], sent: vec![], said: vec![], history: vec![], invites: vec![], err: None, user: String::new(), name: String::new(), progress: None, auth_err: None, notes: vec![], latest: None, coins: None, owned: vec![], gains: vec![], board: None }
     }
     /// Send a login or sign-up and wait for the answer (hashing takes a moment).
     async fn auth(&mut self, m: ToServer) {
@@ -394,6 +410,14 @@ impl Pal {
                     FromServer::Invited { name, room, .. } => self.invites.push((name, room)),
                     FromServer::Note { note } => self.notes.push(note),
                     FromServer::Latest { build } => self.latest = Some(build),
+                    FromServer::Wallet { coins, owned, gain, why } => {
+                        self.coins = Some(coins);
+                        self.owned = owned;
+                        if gain != 0 {
+                            self.gains.push((gain, why));
+                        }
+                    }
+                    FromServer::Board { by, rows, me } => self.board = Some((by, rows, me)),
                     FromServer::SocialErr { msg } => self.err = Some(msg),
                     _ => {}
                 }
@@ -462,7 +486,7 @@ async fn friends_from_request_to_invite() {
     assert_eq!(b.friends[0].unread, 0, "opening reads it");
     // an invite
     let mut host = Bot::new(&s.url).await;
-    host.send(ToServer::Host { v: PROTOCOL, name: "Anna".into(), look: [0; 7], me: Default::default() }).await;
+    host.send(ToServer::Host { v: PROTOCOL, name: "Anna".into(), look: [0; 7], me: (a.code.clone(), a.secret.clone()), wear: [0; 8] }).await;
     host.run(0.2).await;
     a.send(ToServer::Invite { to: b.code.clone(), room: "ZZZZ".into() }).await;
     a.run().await;
@@ -517,9 +541,11 @@ async fn friends_from_request_to_invite() {
     b.send(ToServer::ChatOpen { with: ac.clone() }).await;
     b.run().await;
     assert_eq!(b.history.last().unwrap().text, "while you were out");
-    // someone else's code without the secret is a new account, not theirs
-    let imp = Pal::login(&s2.url, &ac, "wrong", "Eve").await;
-    assert_ne!(imp.code, ac);
+    // someone else's code without the secret gets nothing
+    let mut imp = Pal::open(&s2.url).await;
+    imp.send(ToServer::SHello { v: PROTOCOL, code: ac.clone(), secret: "wrong".into(), name: "Eve".into(), only: false }).await;
+    imp.run().await;
+    assert!(imp.code.is_empty() && imp.auth_err.is_some());
     let a = Pal::login(&s2.url, &ac, &asec, "Anna").await;
     assert_eq!(a.code, ac);
     // unfriending ends it for both
@@ -570,10 +596,14 @@ async fn matches_count_for_stats_between_friends() {
     let path = std::env::temp_dir().join("flunkiebal-test-18797.json");
     let _ = s.child.kill();
     let _ = s.child.wait();
-    std::fs::write(&path, r#"{"accounts":{"OLDONE11":{"secret":"s3cret","name":"Old","friends":[],"requests":[],"sent":[],"read":{}}},"chats":{}}"#).unwrap();
+    std::fs::write(&path, r#"{"accounts":{"OLDONE11":{"secret":"s3cret","name":"Old","user":"old","friends":[],"requests":[],"sent":[],"read":{}},"PHONE111":{"secret":"s3cret","name":"Phone"}},"chats":{}}"#).unwrap();
     s = Server::start_keeping_data(18797);
     let old = Pal::login(&s.url, "OLDONE11", "s3cret", "Old").await;
     assert_eq!(old.code, "OLDONE11", "the old account survives");
+    let mut phone = Pal::open(&s.url).await;
+    phone.send(ToServer::SHello { v: PROTOCOL, code: "PHONE111".into(), secret: "s3cret".into(), name: "Phone".into(), only: false }).await;
+    phone.run().await;
+    assert!(phone.code.is_empty() && phone.auth_err.is_some(), "an account without a password is gone");
     let mut pa = Pal::login(&s.url, "", "", "Anna").await;
     let mut pb = Pal::login(&s.url, "", "", "Bram").await;
     pa.send(ToServer::FriendAdd { code: pb.code.clone() }).await;
@@ -596,10 +626,10 @@ async fn matches_count_for_stats_between_friends() {
     assert_eq!(got.unwrap(), PairStats::default());
     // a match against each other
     let mut a = Bot::new(&s.url).await;
-    a.send(ToServer::Host { v: PROTOCOL, name: "Anna".into(), look: [0; 7], me: (pa.code.clone(), pa.secret.clone()) }).await;
+    a.send(ToServer::Host { v: PROTOCOL, name: "Anna".into(), look: [0; 7], me: (pa.code.clone(), pa.secret.clone()), wear: [0; 8] }).await;
     a.run(0.2).await;
     let mut b = Bot::new(&s.url).await;
-    b.send(ToServer::Join { v: PROTOCOL, code: a.code.clone(), name: "Bram".into(), look: [0; 7], me: (pb.code.clone(), pb.secret.clone()) }).await;
+    b.send(ToServer::Join { v: PROTOCOL, code: a.code.clone(), name: "Bram".into(), look: [0; 7], me: (pb.code.clone(), pb.secret.clone()), wear: [0; 8] }).await;
     b.run(0.2).await;
     a.run(0.1).await;
     a.send(ToServer::Start).await;
@@ -667,19 +697,17 @@ async fn accounts_with_a_password_keep_progress() {
     a.send(ToServer::SProgress { rev: 3, data: r#"{"xp":120}"#.into() }).await;
     a.run().await;
     assert!(a.err.is_none(), "{:?}", a.err);
-    // an account without a password keeps no progress
-    let mut dev = Pal::login(&s.url, "", "", "Bram").await;
-    dev.send(ToServer::SProgress { rev: 1, data: "{}".into() }).await;
-    dev.run().await;
-    assert!(dev.err.unwrap().contains("Log in"));
-    // a phone's own account gets a password: the same account, friends and all, and the name is the username
-    let mut phone = Pal::login(&s.url, "", "", "Phone name").await;
+    // no account by just connecting, whatever the game says
+    for only in [false, true] {
+        let mut dev = Pal::open(&s.url).await;
+        dev.send(ToServer::SHello { v: PROTOCOL, code: String::new(), secret: String::new(), name: "Bram".into(), only }).await;
+        dev.run().await;
+        assert!(dev.code.is_empty() && dev.auth_err.is_some());
+    }
+    let mut phone = Pal::login(&s.url, "", "", "Bram").await;
     let phone_code = phone.code.clone();
-    phone.code.clear();
-    phone.auth(ToServer::Register { v: PROTOCOL, user: "Bram".into(), pass: "longenough".into(), name: "Phone name".into() }).await;
-    assert_eq!(phone.code, phone_code, "{:?}", phone.auth_err);
     assert_eq!(phone.user, "bram");
-    // and logging in to another account on that connection switches to it
+    // logging in to another account on that connection switches to it
     phone.code.clear();
     phone.auth(ToServer::Login { v: PROTOCOL, user: "anna.b".into(), pass: "correct horse".into(), name: "x".into() }).await;
     assert_eq!(phone.user, "anna.b");
@@ -765,7 +793,8 @@ async fn bot_for_a_phone() {
     let code = std::env::var("FLUNKI_JOIN").expect("FLUNKI_JOIN=<room code>");
     let secs: u64 = std::env::var("FLUNKI_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
     let mut b = Bot::new(&url).await;
-    b.send(ToServer::Join { v: PROTOCOL, code, name: "Bot".into(), look: [0; 7], me: Default::default() }).await;
+    let me = (std::env::var("FLUNKI_CODE").unwrap_or_default(), std::env::var("FLUNKI_SECRET").unwrap_or_default());
+    b.send(ToServer::Join { v: PROTOCOL, code, name: "Bot".into(), look: [0; 7], me, wear: [0; 8] }).await;
     b.run(0.5).await;
     println!("joined as {} ({:?})", b.id, b.err);
     let t0 = Instant::now();
@@ -794,4 +823,124 @@ async fn bot_for_a_phone() {
             b.input(Input::Pad { foot, at }).await;
         }
     }
+}
+
+#[tokio::test]
+async fn coins_bets_shop_and_leaderboard() {
+    let s = Server::start(18801);
+    let mut pa = Pal::login(&s.url, "", "", "Anna").await;
+    let mut pb = Pal::login(&s.url, "", "", "Bram").await;
+    assert_eq!(pa.coins, Some(START_COINS), "coins to start with");
+    // too dear, and not for sale
+    pa.send(ToServer::Buy { item: 10 }).await;
+    pa.run().await;
+    assert!(pa.err.take().unwrap().contains("costs"));
+    pa.send(ToServer::Buy { item: 2 }).await;
+    pa.run().await;
+    assert!(pa.err.take().unwrap().contains("not for sale"));
+    pa.send(ToServer::Board { by: BOARD_RATING }).await;
+    pa.run().await;
+    let (_, rows, me) = pa.board.take().unwrap();
+    assert!(rows.is_empty() && me.is_none(), "nobody has played yet");
+    // a room with a bet
+    let mut a = Bot::new(&s.url).await;
+    a.send(ToServer::Host { v: PROTOCOL, name: "Anna".into(), look: [0; 7], me: (pa.code.clone(), pa.secret.clone()), wear: [0; 8] }).await;
+    a.run(0.2).await;
+    let mut b = Bot::new(&s.url).await;
+    b.send(ToServer::Join { v: PROTOCOL, code: a.code.clone(), name: "Bram".into(), look: [0; 7], me: (pb.code.clone(), pb.secret.clone()), wear: [0; 8] }).await;
+    b.run(0.2).await;
+    // more than anyone has
+    a.send(ToServer::Config { arena: "vondel".into(), diff: 1, stake: 250 }).await;
+    a.run(0.1).await;
+    a.send(ToServer::Start).await;
+    a.run(0.3).await;
+    assert_eq!(a.phase, PHASE_LOBBY);
+    assert!(a.notices.iter().any(|n| n.contains("hasn't got 250 coins")), "{:?}", a.notices);
+    // a stake that isn't on the list is ignored
+    a.send(ToServer::Config { arena: "vondel".into(), diff: 1, stake: 33 }).await;
+    a.send(ToServer::Config { arena: "vondel".into(), diff: 1, stake: 50 }).await;
+    a.send(ToServer::Start).await;
+    b.run(0.3).await;
+    assert_eq!(b.phase, PHASE_PLAYING);
+    pa.run().await;
+    assert_eq!(pa.coins, Some(START_COINS - 50), "the bet is taken at kickoff");
+    play_out(&s, &mut a, &mut b).await;
+    let a_won = a.g.win == a.g.my_team;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut pa = Pal::login(&s.url, &pa.code, &pa.secret, "Anna").await;
+    let mut pb = Pal::login(&s.url, &pb.code, &pb.secret, "Bram").await;
+    let (w, l) = if a_won { (&mut pa, &mut pb) } else { (&mut pb, &mut pa) };
+    assert_eq!(w.coins, Some(START_COINS - 50 + 100 + WIN_COINS), "the pot and the win\n{}", s.dump());
+    assert_eq!(l.coins, Some(START_COINS - 50 + LOSS_COINS));
+    // the leaderboards
+    for by in [BOARD_RATING, BOARD_WINS, BOARD_COINS, BOARD_HITS] {
+        w.send(ToServer::Board { by }).await;
+        w.run().await;
+        let (got, rows, me) = w.board.take().unwrap();
+        assert_eq!(got, by);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(me.as_ref().unwrap().code, w.code);
+        if by != BOARD_HITS {
+            assert_eq!(rows[0].code, w.code, "the winner leads board {by}");
+        }
+    }
+    let (_, rows, _) = { l.send(ToServer::Board { by: BOARD_RATING }).await; l.run().await; l.board.take().unwrap() };
+    assert!(rows[0].rating > START_RATING as i32 && rows[1].rating < START_RATING as i32, "{rows:?}");
+    assert_eq!((rows[0].played, rows[0].wins, rows[1].wins), (1, 1, 0));
+    // accuracy wants more throws first
+    l.send(ToServer::Board { by: BOARD_ACCURACY }).await;
+    l.run().await;
+    assert!(l.board.take().unwrap().1.is_empty());
+    // shopping with the winnings
+    w.send(ToServer::Buy { item: 6 }).await;
+    w.run().await;
+    assert_eq!(w.owned, vec![6]);
+    assert_eq!(w.coins, Some(START_COINS - 50 + 100 + WIN_COINS - 150));
+    w.send(ToServer::Buy { item: 6 }).await;
+    w.run().await;
+    assert!(w.err.take().unwrap().contains("already"));
+}
+
+#[tokio::test]
+async fn bets_need_accounts_and_are_refunded_when_called_off() {
+    let s = Server::start(18802);
+    let pa = Pal::login(&s.url, "", "", "Anna").await;
+    let mut pb = Pal::login(&s.url, "", "", "Bram").await;
+    let mut a = Bot::new(&s.url).await;
+    a.send(ToServer::Host { v: PROTOCOL, name: "Anna".into(), look: [0; 7], me: (pa.code.clone(), pa.secret.clone()), wear: [0; 8] }).await;
+    a.run(0.2).await;
+    // nobody plays online without logging in
+    let mut guest = Bot::new(&s.url).await;
+    guest.send(ToServer::Join { v: PROTOCOL, code: a.code.clone(), name: "Guest".into(), look: [0; 7], me: Default::default(), wear: [0; 8] }).await;
+    guest.run(0.2).await;
+    assert_eq!(guest.err.as_deref(), Some("Log in to play online"));
+    guest.err = None;
+    guest.send(ToServer::Host { v: PROTOCOL, name: "Guest".into(), look: [0; 7], me: (pa.code.clone(), "wrong".into()), wear: [0; 8] }).await;
+    guest.run(0.2).await;
+    assert_eq!(guest.err.as_deref(), Some("Log in to play online"));
+    // a bet needs both teams
+    a.send(ToServer::Config { arena: "vondel".into(), diff: 1, stake: 10 }).await;
+    a.send(ToServer::Start).await;
+    a.run(0.3).await;
+    assert_eq!(a.phase, PHASE_LOBBY);
+    assert!(a.notices.iter().any(|n| n.contains("both teams")), "{:?}", a.notices);
+    let mut b = Bot::new(&s.url).await;
+    b.send(ToServer::Join { v: PROTOCOL, code: a.code.clone(), name: "Bram".into(), look: [0; 7], me: (pb.code.clone(), pb.secret.clone()), wear: [0; 8] }).await;
+    b.run(0.2).await;
+    a.send(ToServer::Start).await;
+    b.run(0.3).await;
+    assert_eq!(b.phase, PHASE_PLAYING);
+    pb.run().await;
+    assert_eq!(pb.coins, Some(START_COINS - 10));
+    // everyone goes: the room closes after a while and the bets come back
+    a.send(ToServer::Leave).await;
+    b.send(ToServer::Leave).await;
+    a.run(0.2).await;
+    let t0 = Instant::now();
+    while !s.logged("bets called off") {
+        assert!(t0.elapsed().as_secs() < 5, "{}", s.dump());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let pb = Pal::login(&s.url, &pb.code, &pb.secret, "Bram").await;
+    assert_eq!(pb.coins, Some(START_COINS));
 }

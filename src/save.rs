@@ -26,10 +26,12 @@ pub struct Profile {
     pub shorts: usize,
     pub voice: usize,
     pub hat: u8,
+    /// body, build, hair and clothes (`body::Wear::to_bytes`)
+    pub wear: [u8; 8],
 }
 impl Default for Profile {
     fn default() -> Self {
-        Profile { name: "Player".into(), color: 0, skin: 1, hair: 1, shorts: 1, voice: 1, hat: 0 }
+        Profile { name: "Player".into(), color: 0, skin: 1, hair: 1, shorts: 1, voice: 1, hat: 0, wear: crate::body::Wear::starter(0).to_bytes() }
     }
 }
 
@@ -122,6 +124,9 @@ pub struct Save {
     pub legacy: Option<String>,
     /// logged in where it's optional (the phone): its own account, progression and rev, back on logging out
     pub device: Option<((String, String, String), String, u64)>,
+    /// the account's coins and the hats it bought, as the server last said (it keeps them)
+    pub coins: u32,
+    pub owned: Vec<u8>,
 }
 
 /// What of the save belongs to the account and is kept on the server for it.
@@ -217,10 +222,17 @@ impl Save {
     pub fn logged_in(&self) -> bool {
         !self.user.is_empty()
     }
+    /// May play online, have friends, coins and a place on the leaderboards: only logged in, everywhere.
+    pub fn online(&self) -> bool {
+        self.logged_in() && self.account.0 == server()
+    }
     /// Log out: forget the account and what it had earned, keep the settings. Where logging in is
     /// optional, the device's own player is back.
     pub fn log_out(&mut self) {
         self.user.clear();
+        // the server sends the coins of whoever is logged in next
+        self.coins = 0;
+        self.owned.clear();
         match self.device.take() {
             Some((account, progress, rev)) => {
                 self.account = account;
@@ -277,7 +289,7 @@ fn write(_t: &str) {}
 
 // ---------- progression ----------
 /// The highest level anything unlocks at; levels themselves go on for ever.
-pub const TOP_UNLOCK: u32 = 10;
+pub const TOP_UNLOCK: u32 = 9;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Unlock {
     Hat(u8),
@@ -292,27 +304,22 @@ pub enum Unlock {
     Emote(usize),
 }
 /// Whatever isn't in here you have from the start: three quick messages (Proost!, Nice throw!, Drink up!)
-/// and two emotes (Wave, Clap).
-pub const UNLOCKS: [(u32, Unlock, &str); 33] = [
-    (2, Unlock::Hat(1), "Cap"),
+/// and two emotes (Wave, Clap). Except the shop's hats (`proto::SHOP`), which are bought with coins.
+pub const UNLOCKS: [(u32, Unlock, &str); 28] = [
     (2, Unlock::Shirt(6), "Teal shirt"),
     (2, Unlock::Hair(4), "Blond hair"),
     (2, Unlock::Shorts(3), "Khaki shorts"),
     (3, Unlock::Arena("roof"), "Science Park dak"),
     (3, Unlock::Voice(0), "Deep voice"),
     (3, Unlock::Shirt(7), "Green shirt"),
-    (4, Unlock::Hat(2), "Bucket hat"),
     (4, Unlock::Shirt(3), "Pink shirt"),
     (4, Unlock::Shorts(4), "White shorts"),
     (5, Unlock::Arena("cafe"), "Café de Krul"),
     (5, Unlock::Hair(5), "Ginger hair"),
-    (6, Unlock::Hat(3), "Sunglasses"),
     (6, Unlock::Shirt(4), "Purple shirt"),
     (6, Unlock::Shorts(5), "Burgundy shorts"),
     (7, Unlock::Arena("club"), "Duplex"),
-    (8, Unlock::Hat(4), "Headband"),
     (9, Unlock::Voice(3), "Bright voice"),
-    (10, Unlock::Hat(5), "Flunk King crown"),
     (2, Unlock::Arena("evening"), "Vondelpark evening"),
     (9, Unlock::Arena("krakau"), "Krakau Hostel"),
     (2, Unlock::Quick(8), "“GG”"),
@@ -363,8 +370,16 @@ impl Save {
     pub fn level(&self) -> u32 {
         level_of(self.xp).lv
     }
+    /// A piece of clothing you may wear (0, nothing, always): free ones, or bought.
+    pub fn has_item(&self, id: u8) -> bool {
+        id == 0 || crate::net::clothes(id).is_some_and(|c| c.price == 0) || self.owned.contains(&id)
+    }
     pub fn unlocked(&self, u: Unlock) -> bool {
-        self.level() >= unlock_lv(u)
+        match u {
+            // hats are the shop's only (the faces have hats of their own)
+            Unlock::Hat(h) => crate::net::price_of(h).is_some() && self.owned.contains(&h),
+            _ => self.level() >= unlock_lv(u),
+        }
     }
     pub fn add_xp(&mut self, n: u32, parts: Vec<String>) -> XpResult {
         let n = if self.locked() { 0 } else { n };

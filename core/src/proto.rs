@@ -7,10 +7,10 @@ use glam::{vec3, Vec3};
 use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the messages change; a mismatch is told to the player instead of misbehaving.
-pub const PROTOCOL: u32 = 11;
+pub const PROTOCOL: u32 = 12;
 /// This build of the game. Bumped with every release (the APK's versionCode is read from here, see
 /// `android/app/build.gradle`); the server says which is the latest (`Latest`), so an old app can tell.
-pub const APP_BUILD: u32 = 12;
+pub const APP_BUILD: u32 = 15;
 /// Where the newest APK is.
 pub const APK_URL: &str = "https://flunkcie.nl/downloads/flunkiebal.apk";
 pub const SNAP_HZ: f32 = 20.0;
@@ -36,13 +36,35 @@ pub fn arena_bounds(id: &str) -> Option<(f32, f32)> {
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum ToServer {
     /// `me`: friend code and secret, if there is an account, so the match counts for the stats with friends.
-    Host { v: u32, name: String, look: [u8; 7], me: (String, String) },
-    Join { v: u32, code: String, name: String, look: [u8; 7], me: (String, String) },
+    /// `wear`: body, build, hair and clothes (see the game's `body::Wear`); older games send none
+    Host {
+        v: u32,
+        name: String,
+        look: [u8; 7],
+        me: (String, String),
+        #[serde(default)]
+        wear: [u8; 8],
+    },
+    Join {
+        v: u32,
+        code: String,
+        name: String,
+        look: [u8; 7],
+        me: (String, String),
+        #[serde(default)]
+        wear: [u8; 8],
+    },
     /// Back after a lost connection: take the same seat again.
     Resume { v: u32, code: String, token: String },
     List,
     Open { open: bool },
-    Config { arena: String, diff: u8 },
+    /// `stake`: the bet, in coins each (one of `STAKES`; 0 for none).
+    Config {
+        arena: String,
+        diff: u8,
+        #[serde(default)]
+        stake: u32,
+    },
     Team { team: u8 },
     Start,
     /// Something done in the match; `n` counts up and comes back as the snapshot's `a`.
@@ -85,6 +107,10 @@ pub enum ToServer {
     Invite { to: String, room: String },
     /// What you two have played, the server keeps count.
     FriendStats { with: String },
+    /// The leaderboard, sorted by `BOARD_*`: the answer is `Board`.
+    Board { by: u8 },
+    /// Buy something from the shop (a hat or clothes, by number, see `price_of`): the answer is `Wallet`.
+    Buy { item: u8 },
     /// A bug report, from anyone, logged in or not: what they wrote, and what the game adds about itself
     /// (build, platform, screen, its last log lines). The answer is `BugSaved`.
     Bug { v: u32, text: String, info: String },
@@ -104,7 +130,17 @@ pub enum Input {
 #[serde(tag = "t", rename_all = "lowercase")]
 pub enum FromServer {
     Welcome { code: String, id: u32, token: String, resumed: bool },
-    Roster { members: Vec<Member>, host: u32, arena: String, diff: u8, phase: u8, open: bool },
+    Roster {
+        members: Vec<Member>,
+        host: u32,
+        arena: String,
+        diff: u8,
+        phase: u8,
+        open: bool,
+        /// the bet, in coins each (0: none)
+        #[serde(default)]
+        stake: u32,
+    },
     /// `a`: the last input of yours this snapshot includes.
     Snap { a: u32, s: Box<Snap> },
     /// Everyone's connection, once a second.
@@ -145,6 +181,11 @@ pub enum FromServer {
     /// phone's background check too (`NotesReq`).
     Note { note: Note },
     FriendStats { with: String, s: PairStats },
+    /// Your coins and what you've bought, after logging in and whenever it changes. `gain` is how much
+    /// that change was and `why` says what for (nothing to say: 0 and empty).
+    Wallet { coins: u32, owned: Vec<u8>, gain: i64, why: String },
+    /// The top of the leaderboard, and where you are on it (None: not on it yet).
+    Board { by: u8, rows: Vec<BoardRow>, me: Option<BoardRow> },
     /// Not fatal, for the friends screen.
     SocialErr { msg: String },
 }
@@ -197,6 +238,277 @@ pub fn http_url(ws: &str) -> String {
     } else {
         ws.to_string()
     }
+}
+
+// ---------- coins and the leaderboard ----------
+/// Every account starts with this much, and gets the daily bonus the first time it's on each day (UTC).
+pub const START_COINS: u32 = 100;
+pub const DAILY_COINS: u32 = 25;
+/// A finished online match, against people: win or lose. Against only the computer: a win.
+pub const WIN_COINS: u32 = 20;
+pub const LOSS_COINS: u32 = 5;
+pub const CPU_WIN_COINS: u32 = 5;
+/// The most coins matches earn an account in a day (bets aside).
+pub const MATCH_COINS_DAY: u32 = 200;
+/// What the host of a room can bet: each player puts this many coins in, the winners share the pot.
+pub const STAKES: [u32; 6] = [0, 10, 25, 50, 100, 250];
+/// The shop: (hat, price). Hats in here are bought, never unlocked by level.
+pub const SHOP: [(u8, u32); 5] = [(6, 150), (7, 250), (8, 400), (9, 600), (10, 1000)];
+/// What something in the shop costs without a discount (`None`: not for sale; clothes that cost nothing
+/// everyone has). Costumes (`BUNDLE0` up) depend on what you have: see `bundle_price`.
+pub fn price_of(item: u8) -> Option<u32> {
+    SHOP.iter().find(|s| s.0 == item).map(|s| s.1).or_else(|| clothes(item).map(|c| c.price).filter(|p| *p > 0))
+}
+/// What something costs today (`day`: days since 1970, UTC): the day's featured items are `FEATURED_OFF` %
+/// cheaper.
+pub fn price_on(item: u8, day: u64) -> Option<u32> {
+    let p = price_of(item)?;
+    let (big, small) = featured(day);
+    Some(if big.contains(&item) || small.contains(&item) { p * (100 - FEATURED_OFF) / 100 } else { p })
+}
+pub const FEATURED_OFF: u32 = 20;
+/// A costume costs this much less than its pieces (those you don't have yet).
+pub const BUNDLE_OFF: u32 = 25;
+/// Costumes are numbered from here, in `bundles()` order.
+pub const BUNDLE0: u8 = 200;
+/// The shop's rarity of a hat for sale (by its price).
+pub fn hat_rarity(price: u32) -> u8 {
+    match price {
+        0..=200 => 1,
+        201..=450 => 2,
+        451..=800 => 3,
+        _ => 4,
+    }
+}
+/// Today's featured items: two big ones (epic or legendary) and six more, the same for everyone.
+pub fn featured(day: u64) -> ([u8; 2], [u8; 6]) {
+    let mut h = day.wrapping_mul(0x9e3779b97f4a7c15) | 1;
+    let mut next = |n: usize| {
+        h ^= h << 13;
+        h ^= h >> 7;
+        h ^= h << 17;
+        (h % n.max(1) as u64) as usize
+    };
+    let all: Vec<(u8, u8)> = CLOTHES.iter().filter(|c| c.price > 0).map(|c| (c.id, c.rarity)).chain(SHOP.iter().map(|&(h, p)| (h, hat_rarity(p)))).collect();
+    let mut taken: Vec<u8> = Vec::new();
+    let mut pick = |good: &dyn Fn(u8) -> bool, out: &mut [u8]| {
+        let pool: Vec<u8> = all.iter().filter(|(_, r)| good(*r)).map(|(i, _)| *i).collect();
+        for slot in out.iter_mut() {
+            for _ in 0..64 {
+                let i = pool[next(pool.len())];
+                if !taken.contains(&i) {
+                    taken.push(i);
+                    *slot = i;
+                    break;
+                }
+            }
+        }
+    };
+    let (mut big, mut small) = ([0; 2], [0; 6]);
+    pick(&|r| r >= 3, &mut big);
+    pick(&|r| r < 4, &mut small);
+    (big, small)
+}
+/// A costume: everything of one outfit (hair, face, top, trousers, shoes) together.
+#[derive(Clone, Debug)]
+pub struct Bundle {
+    pub id: u8,
+    pub name: &'static str,
+    /// "m/Punk": the men's or the women's, and the outfit's pieces' names start with this
+    pub set: &'static str,
+    pub items: Vec<u8>,
+}
+/// Every costume: the outfits with at least three pieces that aren't all free.
+pub fn bundles() -> Vec<Bundle> {
+    let mut out = Vec::new();
+    for (set, name) in COSTUMES {
+        let items: Vec<u8> = CLOTHES.iter().filter(|c| c.piece.strip_prefix(set).is_some_and(|r| r.starts_with('_'))).map(|c| c.id).collect();
+        if items.len() >= 3 && items.iter().any(|i| price_of(*i).is_some()) {
+            out.push(Bundle { id: BUNDLE0 + out.len() as u8, name, set, items });
+        }
+    }
+    out
+}
+pub fn bundle(id: u8) -> Option<Bundle> {
+    bundles().into_iter().find(|b| b.id == id)
+}
+/// What a costume costs someone who has `owned`: its pieces they don't have, less `BUNDLE_OFF` %; and those pieces.
+pub fn bundle_price(b: &Bundle, owned: &[u8]) -> (u32, Vec<u8>) {
+    let missing: Vec<u8> = b.items.iter().copied().filter(|i| price_of(*i).is_some() && !owned.contains(i)).collect();
+    let sum: u32 = missing.iter().filter_map(|i| price_of(*i)).sum();
+    (sum * (100 - BUNDLE_OFF) / 100, missing)
+}
+/// The outfits, by the start of their pieces' names, and what the shop calls them.
+pub const COSTUMES: [(&str, &str); 22] = [
+    ("m/Casual", "Casual"),
+    ("m/Casual2", "Street"),
+    ("m/Beach", "Beach Bum"),
+    ("m/Worker", "Site Worker"),
+    ("m/Farmer", "Farmer"),
+    ("m/Suit", "Business"),
+    ("m/Punk", "Punk"),
+    ("m/Adventurer", "Explorer"),
+    ("m/Swat", "SWAT"),
+    ("m/SpaceSuit", "Astronaut"),
+    ("m/King", "Royalty"),
+    ("m/Horse", "Horse Head"),
+    ("f/Casual", "Casual"),
+    ("f/Worker", "Site Worker"),
+    ("f/Formal", "Gala"),
+    ("f/Suit", "Business"),
+    ("f/Punk", "Punk"),
+    ("f/Adventurer", "Explorer"),
+    ("f/Medieval", "Ranger"),
+    ("f/Soldier", "Soldier"),
+    ("f/SciFi", "Sci-fi"),
+    ("f/Witch", "Witch"),
+];
+/// A piece of clothing (or a hairstyle) from the people's meshes: `piece` is "m/" or "f/" (the men's or
+/// the women's) and the mesh's name; `rarity` 0 common … 4 legendary. Numbers from 32 up; hats are 1–31.
+#[derive(Clone, Copy, Debug)]
+pub struct Item {
+    pub id: u8,
+    pub piece: &'static str,
+    pub name: &'static str,
+    pub price: u32,
+    pub rarity: u8,
+}
+pub fn clothes(id: u8) -> Option<&'static Item> {
+    CLOTHES.get((id as usize).wrapping_sub(32)).filter(|c| c.id == id)
+}
+/// Every piece of the Ultimate Modular Men and Women packs (Quaternius), in the order of the game's meshes
+/// (`assets/people_m.glb`, then `people_f.glb`): the shop's pictures (`assets/shop.png`) go by that order too.
+pub const CLOTHES: [Item; 106] = [
+    Item { id: 32, piece: "m/Adventurer_Body", name: "Explorer top", price: 360, rarity: 2 },
+    Item { id: 33, piece: "m/Adventurer_Feet", name: "Explorer shoes", price: 180, rarity: 2 },
+    Item { id: 34, piece: "m/Adventurer_Hair", name: "Explorer hair", price: 300, rarity: 2 },
+    Item { id: 35, piece: "m/Adventurer_Head", name: "Explorer face", price: 240, rarity: 2 },
+    Item { id: 36, piece: "m/Adventurer_Legs", name: "Explorer trousers", price: 240, rarity: 2 },
+    Item { id: 37, piece: "m/Backpack_Back", name: "Hiking backpack", price: 150, rarity: 1 },
+    Item { id: 38, piece: "m/Beach_Body", name: "Beach top", price: 180, rarity: 1 },
+    Item { id: 39, piece: "m/Beach_Feet", name: "Flip-flops", price: 90, rarity: 1 },
+    Item { id: 40, piece: "m/Beach_Hair", name: "Beach hair", price: 150, rarity: 1 },
+    Item { id: 41, piece: "m/Beach_Head", name: "Beach face", price: 120, rarity: 1 },
+    Item { id: 42, piece: "m/Beach_Legs", name: "Beach shorts", price: 120, rarity: 1 },
+    Item { id: 43, piece: "m/Casual2_Body", name: "Street top", price: 0, rarity: 0 },
+    Item { id: 44, piece: "m/Casual2_Feet", name: "Street shoes", price: 0, rarity: 0 },
+    Item { id: 45, piece: "m/Casual2_Hair", name: "Street hair", price: 0, rarity: 0 },
+    Item { id: 46, piece: "m/Casual2_Head", name: "Street face", price: 0, rarity: 0 },
+    Item { id: 47, piece: "m/Casual2_Legs", name: "Street trousers", price: 0, rarity: 0 },
+    Item { id: 48, piece: "m/Casual_Body", name: "Casual top", price: 0, rarity: 0 },
+    Item { id: 49, piece: "m/Casual_Feet", name: "Casual shoes", price: 0, rarity: 0 },
+    Item { id: 50, piece: "m/Casual_Hair", name: "Casual hair", price: 0, rarity: 0 },
+    Item { id: 51, piece: "m/Casual_Head", name: "Casual face", price: 0, rarity: 0 },
+    Item { id: 52, piece: "m/Casual_Legs", name: "Casual trousers", price: 0, rarity: 0 },
+    Item { id: 53, piece: "m/Farmer_Body", name: "Farmer top", price: 180, rarity: 1 },
+    Item { id: 54, piece: "m/Farmer_Feet", name: "Farmer shoes", price: 90, rarity: 1 },
+    Item { id: 55, piece: "m/Farmer_Head", name: "Straw hat", price: 120, rarity: 1 },
+    Item { id: 56, piece: "m/Farmer_Legs", name: "Dungarees", price: 120, rarity: 1 },
+    Item { id: 57, piece: "m/Horse_Body", name: "Horse hoodie", price: 1080, rarity: 4 },
+    Item { id: 58, piece: "m/Horse_Feet", name: "Horse shoes", price: 540, rarity: 4 },
+    Item { id: 59, piece: "m/Horse_Head", name: "Horse mask", price: 720, rarity: 4 },
+    Item { id: 60, piece: "m/Horse_Legs", name: "Horse trousers", price: 720, rarity: 4 },
+    Item { id: 61, piece: "m/King_Body", name: "Royal armour", price: 1080, rarity: 4 },
+    Item { id: 62, piece: "m/King_Feet", name: "Royal shoes", price: 540, rarity: 4 },
+    Item { id: 63, piece: "m/King_Hair", name: "Royal mane", price: 900, rarity: 4 },
+    Item { id: 64, piece: "m/King_Head", name: "Royal crown", price: 720, rarity: 4 },
+    Item { id: 65, piece: "m/King_Legs", name: "Royal trousers", price: 720, rarity: 4 },
+    Item { id: 66, piece: "m/Punk_Body", name: "Punk top", price: 360, rarity: 2 },
+    Item { id: 67, piece: "m/Punk_Feet", name: "Punk shoes", price: 180, rarity: 2 },
+    Item { id: 68, piece: "m/Punk_Hair", name: "Punk hair", price: 300, rarity: 2 },
+    Item { id: 69, piece: "m/Punk_Head", name: "Punk face", price: 240, rarity: 2 },
+    Item { id: 70, piece: "m/Punk_Legs", name: "Punk trousers", price: 240, rarity: 2 },
+    Item { id: 71, piece: "m/SpaceSuit_Body", name: "Space suit", price: 660, rarity: 3 },
+    Item { id: 72, piece: "m/SpaceSuit_Feet", name: "Astronaut shoes", price: 330, rarity: 3 },
+    Item { id: 73, piece: "m/SpaceSuit_Head", name: "Space helmet", price: 440, rarity: 3 },
+    Item { id: 74, piece: "m/SpaceSuit_Legs", name: "Astronaut trousers", price: 440, rarity: 3 },
+    Item { id: 75, piece: "m/Suit_Body", name: "Suit jacket", price: 360, rarity: 2 },
+    Item { id: 76, piece: "m/Suit_Feet", name: "Business shoes", price: 180, rarity: 2 },
+    Item { id: 77, piece: "m/Suit_Hair", name: "Business hair", price: 300, rarity: 2 },
+    Item { id: 78, piece: "m/Suit_Head", name: "Business face", price: 240, rarity: 2 },
+    Item { id: 79, piece: "m/Suit_Legs", name: "Business trousers", price: 240, rarity: 2 },
+    Item { id: 80, piece: "m/Swat_Body", name: "Tactical vest", price: 660, rarity: 3 },
+    Item { id: 81, piece: "m/Swat_Feet", name: "SWAT shoes", price: 330, rarity: 3 },
+    Item { id: 82, piece: "m/Swat_Head", name: "SWAT mask", price: 440, rarity: 3 },
+    Item { id: 83, piece: "m/Swat_Legs", name: "SWAT trousers", price: 440, rarity: 3 },
+    Item { id: 84, piece: "m/Worker_Body", name: "Hi-vis vest", price: 180, rarity: 1 },
+    Item { id: 85, piece: "m/Worker_Feet", name: "Worker shoes", price: 90, rarity: 1 },
+    Item { id: 86, piece: "m/Worker_Head", name: "Hard hat & tache", price: 120, rarity: 1 },
+    Item { id: 87, piece: "m/Worker_Legs", name: "Worker trousers", price: 120, rarity: 1 },
+    Item { id: 88, piece: "f/Adventurer_Feet", name: "Explorer shoes", price: 180, rarity: 2 },
+    Item { id: 89, piece: "f/Adventurer_Body", name: "Explorer top", price: 360, rarity: 2 },
+    Item { id: 90, piece: "f/Adventurer_Hair", name: "Explorer hair", price: 300, rarity: 2 },
+    Item { id: 91, piece: "f/Adventurer_Head", name: "Explorer face", price: 240, rarity: 2 },
+    Item { id: 92, piece: "f/Adventurer_Legs", name: "Explorer trousers", price: 240, rarity: 2 },
+    Item { id: 93, piece: "f/Casual_Feet", name: "Casual shoes", price: 0, rarity: 0 },
+    Item { id: 94, piece: "f/Casual_Body", name: "Casual top", price: 0, rarity: 0 },
+    Item { id: 95, piece: "f/Casual_Hair", name: "Casual hair", price: 0, rarity: 0 },
+    Item { id: 96, piece: "f/Casual_Head", name: "Casual face", price: 0, rarity: 0 },
+    Item { id: 97, piece: "f/Casual_Legs", name: "Casual trousers", price: 0, rarity: 0 },
+    Item { id: 98, piece: "f/Formal_Head", name: "Gala face", price: 240, rarity: 2 },
+    Item { id: 99, piece: "f/Formal_Feet", name: "Gala shoes", price: 180, rarity: 2 },
+    Item { id: 100, piece: "f/Formal_Body", name: "Gala dress", price: 360, rarity: 2 },
+    Item { id: 101, piece: "f/Formal_Hair", name: "Gala hair", price: 300, rarity: 2 },
+    Item { id: 102, piece: "f/Formal_Legs", name: "Gala trousers", price: 240, rarity: 2 },
+    Item { id: 103, piece: "f/Medieval_Feet", name: "Ranger shoes", price: 330, rarity: 3 },
+    Item { id: 104, piece: "f/Medieval_Body", name: "Ranger top", price: 660, rarity: 3 },
+    Item { id: 105, piece: "f/Medieval_Hair", name: "Ranger hair", price: 550, rarity: 3 },
+    Item { id: 106, piece: "f/Medieval_Head", name: "Ranger hood", price: 440, rarity: 3 },
+    Item { id: 107, piece: "f/Medieval_Legs", name: "Ranger trousers", price: 440, rarity: 3 },
+    Item { id: 108, piece: "f/Punk_Feet", name: "Punk shoes", price: 180, rarity: 2 },
+    Item { id: 109, piece: "f/Punk_Body", name: "Punk top", price: 360, rarity: 2 },
+    Item { id: 110, piece: "f/Punk_Hair", name: "Punk hair", price: 300, rarity: 2 },
+    Item { id: 111, piece: "f/Punk_Head", name: "Punk face", price: 240, rarity: 2 },
+    Item { id: 112, piece: "f/Punk_Legs", name: "Punk trousers", price: 240, rarity: 2 },
+    Item { id: 113, piece: "f/SciFi_Feet", name: "Sci-fi shoes", price: 330, rarity: 3 },
+    Item { id: 114, piece: "f/SciFi_Body", name: "Sci-fi top", price: 660, rarity: 3 },
+    Item { id: 115, piece: "f/SciFi_Hair", name: "Sci-fi hair", price: 550, rarity: 3 },
+    Item { id: 116, piece: "f/SciFi_Head", name: "Sci-fi headset", price: 440, rarity: 3 },
+    Item { id: 117, piece: "f/SciFi_Legs", name: "Sci-fi trousers", price: 440, rarity: 3 },
+    Item { id: 118, piece: "f/Soldier_Feet", name: "Soldier shoes", price: 330, rarity: 3 },
+    Item { id: 119, piece: "f/Soldier_Body", name: "Soldier top", price: 660, rarity: 3 },
+    Item { id: 120, piece: "f/Soldier_Hair", name: "Soldier hair", price: 550, rarity: 3 },
+    Item { id: 121, piece: "f/Soldier_Head", name: "Soldier face", price: 440, rarity: 3 },
+    Item { id: 122, piece: "f/Soldier_Legs", name: "Soldier trousers", price: 440, rarity: 3 },
+    Item { id: 123, piece: "f/Suit_Feet", name: "Business shoes", price: 180, rarity: 2 },
+    Item { id: 124, piece: "f/Suit_Body", name: "Suit jacket", price: 360, rarity: 2 },
+    Item { id: 125, piece: "f/Suit_Hair", name: "Business hair", price: 300, rarity: 2 },
+    Item { id: 126, piece: "f/Suit_Head", name: "Business face", price: 240, rarity: 2 },
+    Item { id: 127, piece: "f/Suit_Legs", name: "Business trousers", price: 240, rarity: 2 },
+    Item { id: 128, piece: "f/Witch_Feet", name: "Witch shoes", price: 540, rarity: 4 },
+    Item { id: 129, piece: "f/Witch_Body", name: "Witch dress", price: 1080, rarity: 4 },
+    Item { id: 130, piece: "f/Witch_Hair", name: "Witch hair", price: 900, rarity: 4 },
+    Item { id: 131, piece: "f/Witch_Head", name: "Witch hat", price: 720, rarity: 4 },
+    Item { id: 132, piece: "f/Witch_Legs", name: "Witch trousers", price: 720, rarity: 4 },
+    Item { id: 133, piece: "f/Worker_Feet", name: "Worker shoes", price: 90, rarity: 1 },
+    Item { id: 134, piece: "f/Worker_Body", name: "Worker top", price: 180, rarity: 1 },
+    Item { id: 135, piece: "f/Worker_Hair", name: "Worker hair", price: 150, rarity: 1 },
+    Item { id: 136, piece: "f/Worker_Head", name: "Hard hat", price: 120, rarity: 1 },
+    Item { id: 137, piece: "f/Worker_Legs", name: "Worker trousers", price: 120, rarity: 1 },
+];
+/// The leaderboards: by rating (MMR), wins, coins, hits, and hits per throw (once you've thrown `ACCURACY_MIN`).
+pub const BOARD_RATING: u8 = 0;
+pub const BOARD_WINS: u8 = 1;
+pub const BOARD_COINS: u8 = 2;
+pub const BOARD_HITS: u8 = 3;
+pub const BOARD_ACCURACY: u8 = 4;
+pub const BOARDS: [(u8, &str); 5] = [(BOARD_RATING, "MMR"), (BOARD_WINS, "Wins"), (BOARD_COINS, "Coins"), (BOARD_HITS, "Hits"), (BOARD_ACCURACY, "Hit %")];
+pub const ACCURACY_MIN: u32 = 30;
+pub const BOARD_TOP: usize = 50;
+/// Everyone's rating before their first match against people.
+pub const START_RATING: f32 = 1000.0;
+/// One line of the leaderboard. Only online matches against other people count.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct BoardRow {
+    pub rank: u32,
+    pub code: String,
+    pub name: String,
+    pub rating: i32,
+    pub played: u32,
+    pub wins: u32,
+    pub hits: u32,
+    pub throws: u32,
+    pub coins: u32,
 }
 
 pub const STATUS_FREE: u8 = 0;
@@ -290,6 +602,9 @@ pub struct Member {
     pub name: String,
     pub team: u8,
     pub look: [u8; 7], // shirt, skin, hair, shorts, voice, hat, level
+    /// body, build, hair and clothes (see the game's `body::Wear`)
+    #[serde(default)]
+    pub wear: [u8; 8],
     /// connection gone; their seat is kept for them
     pub away: bool,
 }
@@ -943,7 +1258,7 @@ mod tests {
     use crate::game::{Foul, ThrowSpec};
 
     fn two() -> Vec<Member> {
-        vec![Member { id: 1, name: "A".into(), team: 0, look: [0; 7], away: false }, Member { id: 2, name: "B".into(), team: 1, look: [0; 7], away: false }]
+        vec![Member { id: 1, name: "A".into(), team: 0, look: [0; 7], wear: [0; 8], away: false }, Member { id: 2, name: "B".into(), team: 1, look: [0; 7], wear: [0; 8], away: false }]
     }
     fn server() -> (Game, EvLog) {
         let mut g = Game::new(11);
@@ -1135,7 +1450,7 @@ mod tests {
 
     fn crowd() -> Vec<Member> {
         // three on the first team, two on the second
-        let m = |id: u32, team: u8| Member { id, name: format!("P{id}"), team, look: [0; 7], away: false };
+        let m = |id: u32, team: u8| Member { id, name: format!("P{id}"), team, look: [0; 7], wear: [0; 8], away: false };
         vec![m(1, 0), m(2, 0), m(3, 0), m(4, 1), m(5, 1)]
     }
     fn hit_by(g: &mut Game, t: usize) {

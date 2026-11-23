@@ -373,6 +373,8 @@ pub struct Net {
     pub arena: String,
     pub diff: u8,
     pub open: bool,
+    /// the bet, in coins each (0: none)
+    pub stake: u32,
     pub ping_t: f64,
     pub pending: Vec<ToServer>,
     /// round trip, seconds; 0 until measured
@@ -389,7 +391,7 @@ impl Net {
         let url = url.trim();
         let mut sock = Socket::connect(url)?;
         sock.keepalive();
-        Ok(Net { sock, url: url.into(), id: 0, code: String::new(), token: String::new(), in_room: false, host_id: 0, phase: PHASE_LOBBY, rooms: Vec::new(), members: Vec::new(), arena: "vondel".into(), diff: 1, open: false, ping_t: -10.0, pending: Vec::new(), rtt: 0.0, last_rx: now, opened: now, reconnect: None, status: Vec::new() })
+        Ok(Net { sock, url: url.into(), id: 0, code: String::new(), token: String::new(), in_room: false, host_id: 0, phase: PHASE_LOBBY, rooms: Vec::new(), members: Vec::new(), arena: "vondel".into(), diff: 1, open: false, stake: 0, ping_t: -10.0, pending: Vec::new(), rtt: 0.0, last_rx: now, opened: now, reconnect: None, status: Vec::new() })
     }
     /// Out of the room; the connection stays for the next one.
     pub fn leave_room(&mut self) {

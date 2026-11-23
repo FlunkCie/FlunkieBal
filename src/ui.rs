@@ -11,6 +11,9 @@ use crate::audio::{self, Cue};
 use egui::{pos2, vec2, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Layout, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui};
 use std::sync::Arc;
 
+#[path = "shop.rs"]
+pub(crate) mod shop;
+
 pub const GOLD: Color32 = Color32::from_rgb(0xf2, 0xb6, 0x32);
 pub const INK: Color32 = Color32::from_rgb(0x12, 0x20, 0x1a);
 pub const PANEL: Color32 = Color32::from_rgba_premultiplied(12, 22, 17, 236);
@@ -340,7 +343,13 @@ fn level_chip(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
     let f = if lv.need > 0 { lv.into as f32 / lv.need as f32 } else { 1.0 };
     let name_f = bold(16.0);
     let name_g = ctx.fonts_mut(|fo| fo.layout_no_wrap(name.clone(), name_f.clone(), Color32::WHITE));
-    let sub = if someone || !save::needs_login() { format!("LEVEL {}", lv.lv) } else { format!("{SIGN_IN}  LOG IN") };
+    let sub = if !(someone || !save::needs_login()) {
+        format!("{SIGN_IN}  LOG IN")
+    } else if app.social.ready && app.save.online() {
+        format!("LEVEL {}  ·  {COIN} {}", lv.lv, app.save.coins)
+    } else {
+        format!("LEVEL {}", lv.lv)
+    };
     let sub_g = ctx.fonts_mut(|fo| fo.layout_no_wrap(sub.clone(), bold(12.0), GOLD));
     let w = (52.0 + name_g.size().x.max(sub_g.size().x) + 18.0).clamp(120.0, 230.0);
     egui::Area::new(egui::Id::new("lvchip")).fixed_pos(pos2(sr.right() - 12.0 - w, sr.top() + 12.0)).show(ctx, |ui| {
@@ -512,6 +521,8 @@ pub fn draw(app: &mut FlunkiApp, ctx: &egui::Context, p: &egui::Painter, sr: Rec
             Sheet::Friends => friends_sheet(app, ctx, sr),
             Sheet::Account => account_sheet(app, ctx, sr),
             Sheet::Bug => bug_sheet(app, ctx, sr),
+            Sheet::Shop => shop::shop(app, ctx, sr),
+            Sheet::Board => board_sheet(app, ctx, sr),
             Sheet::None => {}
         }
     }
@@ -596,6 +607,15 @@ fn main_menu(app: &mut FlunkiApp, ctx: &egui::Context, p: &egui::Painter, sr: Re
             }
             ui.horizontal(|ui| {
                 let hw = (iw - 10.0) / 2.0;
+                if row_btn(ui, MEDAL, "LEADERBOARD", "", hw).clicked() {
+                    open_board(app);
+                }
+                if row_btn(ui, SHOP, "SHOP", "", hw).clicked() {
+                    app.open_shop();
+                }
+            });
+            ui.horizontal(|ui| {
+                let hw = (iw - 10.0) / 2.0;
                 if row_btn(ui, BOOK, "RULEBOOK", "", hw).clicked() {
                     app.sheet = Sheet::Rules;
                 }
@@ -645,9 +665,11 @@ fn clubhouse(app: &mut FlunkiApp, ctx: &egui::Context, p: &egui::Painter, sr: Re
             } else if locked {
                 (SIGN_IN, "LOG IN", "Or sign up".to_string())
             } else {
-                (SIGN_IN, "LOG IN", "Keep your player safe".to_string())
+                (SIGN_IN, "LOG IN", "To play online".to_string())
             };
-            let rows: [[(&str, &str, String, Option<Sheet>); 2]; 3] = [
+            let shop = if locked || !app.social.ready { "Hats for coins".to_string() } else { format!("{COIN} {} coins", app.save.coins) };
+            let rows: [[(&str, &str, String, Option<Sheet>); 2]; 4] = [
+                [(SHOP, "SHOP", shop, Some(Sheet::Shop)), (MEDAL, "LEADERBOARD", "MMR · wins · coins".into(), Some(Sheet::Board))],
                 [(TRAINING, "TRAINING", train, Some(Sheet::Train)), (STAR, "PROGRESS", progress, Some(Sheet::Progress))],
                 [(STATS, "STATS", stats, Some(Sheet::Stats)), (FRIENDS, "FRIENDS", friends_line(app), Some(Sheet::Friends))],
                 [(GEAR, "SETTINGS", "Sound, controls, graphics".into(), Some(Sheet::Settings)), (acc_icon, acc, acc_sub, if acc == "LOG OUT" { None } else { Some(Sheet::Account) })],
@@ -678,6 +700,9 @@ fn clubhouse(app: &mut FlunkiApp, ctx: &egui::Context, p: &egui::Painter, sr: Re
     } else if let Some(s) = go {
         if s == Sheet::Profile {
             app.name_edit = app.save.profile.name.clone();
+        }
+        if s == Sheet::Board {
+            open_board(app);
         }
         app.sheet = s;
     }
@@ -781,7 +806,7 @@ fn play_panel(app: &mut FlunkiApp, ctx: &egui::Context, p: &egui::Painter, sr: R
 
 fn online_panel(app: &mut FlunkiApp, ui: &mut Ui, iw: f32) {
     update_row(app, ui, iw);
-    if app.save.locked() {
+    if !app.save.online() {
         login_box(app, ui, iw, "Log in to play online.");
         return;
     }
@@ -874,7 +899,22 @@ fn online_panel(app: &mut FlunkiApp, ui: &mut Ui, iw: f32) {
             app.sheet = Sheet::Friends;
         }
     });
+    let (stake, my_coins) = (app.net.as_ref().map_or(0, |n| n.stake), app.save.coins);
     if host {
+        label_caps(ui, &format!("Bet · you have {my_coins} coins"));
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let sw = ((iw - 5.0 * 6.0) / 6.0).max(40.0);
+            for c in net::STAKES {
+                let t = if c == 0 { "None".to_string() } else { c.to_string() };
+                if seg(ui, &t, app.stake == c, c > my_coins, sw).clicked() && c <= my_coins {
+                    app.stake = c;
+                }
+            }
+        });
+        if app.stake > 0 {
+            ui.label(RichText::new(format!("{COIN} Everyone puts in {} coins, the winners share the pot", app.stake)).color(GOLD).size(13.0));
+        }
         arena_picker(app, ui, iw);
         let mut o = open;
         if toggle(ui, &mut o, "Open to anyone (shows in Find)", iw) {
@@ -885,6 +925,10 @@ fn online_panel(app: &mut FlunkiApp, ui: &mut Ui, iw: f32) {
         }
     } else {
         let arena = ArenaKey::from_id(&app.net.as_ref().unwrap().arena);
+        if stake > 0 {
+            let col = if my_coins >= stake { GOLD } else { BAD };
+            ui.label(RichText::new(format!("{COIN} Bet: {stake} coins each, the winners share the pot · you have {my_coins}")).color(col).size(14.0));
+        }
         ui.label(RichText::new(format!("{} · waiting for the host to start", arena.name())).color(MUTED));
     }
 }
@@ -1766,7 +1810,7 @@ fn friends_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
         if sheet_head(ui, "Friends") {
             close = true;
         }
-        if app.save.locked() {
+        if !app.save.online() {
             login_box(app, ui, w, "Log in to add friends, chat and invite them to a match.");
             return;
         }
@@ -2119,14 +2163,115 @@ fn account_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
         if app.save.locked() {
             login_box(app, ui, w, "Log in to play online, add friends and earn XP.");
         } else if !app.save.logged_in() {
-            // optional here: the phone has a player of its own
-            login_box(app, ui, w, "Sign up to keep this player, its friends and progress under a username and password, and play as them on the web too.");
+            // the phone plays offline without one; online needs it
+            login_box(app, ui, w, "Log in to play online, add friends, earn coins and get on the leaderboards. Sign up and this phone's player and progress come along.");
             ui.label(RichText::new("Logging in to another account switches to it; log out to get this phone's own player back.").color(MUTED).size(13.0));
         } else {
             ui.label(RichText::new(format!("{CHECK} Logged in as {}", app.save.user)).color(GOOD).size(16.0));
             close |= done_row(ui, w);
         }
     });
+    if close {
+        app.sheet = Sheet::None;
+    }
+}
+
+// ---------- coins ----------
+/// Show the leaderboard, freshly asked for.
+fn open_board(app: &mut FlunkiApp) {
+    app.social.ask_board(app.board);
+    app.sheet = Sheet::Board;
+}
+
+/// Hats for coins. The server keeps the coins and what's bought, and says yes or no.
+/// The leaderboards: online matches against people only, each kept by the server.
+fn board_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
+    let mut close = false;
+    let mut pick = None;
+    tall_sheet(ctx, sr, "board", 0.78, |ui, w, h| {
+        if sheet_head(ui, "Leaderboard") {
+            close = true;
+        }
+        if !app.save.online() {
+            login_box(app, ui, w, "Log in to see the leaderboards and get on them.");
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let sw = ((w - 4.0 * 6.0) / 5.0).max(50.0);
+            for (k, name) in net::BOARDS {
+                if seg(ui, name, app.board == k, false, sw).clicked() {
+                    pick = Some(k);
+                }
+            }
+        });
+        let by = app.board;
+        let value = |r: &net::BoardRow| match by {
+            net::BOARD_WINS => format!("{}", r.wins),
+            net::BOARD_COINS => format!("{COIN} {}", r.coins),
+            net::BOARD_HITS => format!("{}", r.hits),
+            net::BOARD_ACCURACY => format!("{:.0}%", 100.0 * r.hits as f32 / r.throws.max(1) as f32),
+            _ => format!("{}", r.rating),
+        };
+        let sub = |r: &net::BoardRow| format!("{} MMR · {} won of {} · {} hits", r.rating, r.wins, r.played, r.hits);
+        let me = app.social.code.clone();
+        let line = |ui: &mut Ui, r: &net::BoardRow| {
+            let (rr, _) = ui.allocate_exact_size(vec2(w, 48.0), Sense::hover());
+            let p = ui.painter();
+            let mine = r.code == me;
+            p.rect_filled(rr, 10.0, if mine { Color32::from_rgba_unmultiplied(0xf2, 0xb6, 0x32, 30) } else { CARD });
+            let medal = match r.rank {
+                1 => Some(GOLD),
+                2 => Some(Color32::from_rgb(0xc8, 0xcc, 0xd0)),
+                3 => Some(Color32::from_rgb(0xcd, 0x7f, 0x32)),
+                _ => None,
+            };
+            let rc = rr.left_center() + vec2(22.0, 0.0);
+            match medal {
+                Some(c) => {
+                    p.circle_filled(rc, 13.0, c);
+                    p.text(rc, Align2::CENTER_CENTER, r.rank.to_string(), bold(15.0), INK);
+                }
+                None => {
+                    p.text(rc, Align2::CENTER_CENTER, r.rank.to_string(), bold(15.0), MUTED);
+                }
+            }
+            let v = value(r);
+            let vg = p.layout_no_wrap(v, bold(18.0), GOLD);
+            let vx = rr.right() - 12.0 - vg.size().x;
+            p.galley(pos2(vx, rr.center().y - vg.size().y / 2.0), vg, GOLD);
+            let tw = vx - rr.left() - 52.0;
+            p.text(pos2(rr.left() + 44.0, rr.top() + 6.0), Align2::LEFT_TOP, fit(p, &r.name, bold(16.0), tw), bold(16.0), if mine { GOLD } else { Color32::WHITE });
+            p.text(pos2(rr.left() + 44.0, rr.top() + 27.0), Align2::LEFT_TOP, fit(p, &sub(r), FontId::proportional(12.0), tw), FontId::proportional(12.0), MUTED);
+        };
+        let got = app.social.boards.get(&by).cloned();
+        if !app.social.ready {
+            ui.label(RichText::new("Connecting to the server…").color(MUTED));
+        }
+        let note = if by == net::BOARD_ACCURACY { format!("Hits per throw, from {} throws on. ", net::ACCURACY_MIN) } else { String::new() };
+        ui.label(RichText::new(format!("{note}Online matches against other players count.")).color(MUTED).size(13.0));
+        let Some((rows, mine)) = got else { return };
+        let below = mine.as_ref().filter(|m| m.rank as usize > rows.len());
+        egui::ScrollArea::vertical().id_salt("boardlist").max_height(h - 130.0 - if below.is_some() { 54.0 } else { 0.0 }).auto_shrink([false, false]).show(ui, |ui| {
+            if rows.is_empty() {
+                ui.label(RichText::new("Nobody on it yet: play someone online!").color(MUTED));
+            }
+            for r in &rows {
+                line(ui, r);
+            }
+        });
+        match (below, &mine) {
+            (Some(m), _) => line(ui, m),
+            (None, None) => {
+                ui.label(RichText::new("You're not on it yet: play someone online.").color(MUTED).size(13.0));
+            }
+            _ => {}
+        }
+    });
+    if let Some(k) = pick {
+        app.board = k;
+        app.social.ask_board(k);
+    }
     if close {
         app.sheet = Sheet::None;
     }
@@ -2197,21 +2342,10 @@ fn profile_sheet(app: &mut FlunkiApp, ctx: &egui::Context, sr: Rect) {
                 }
             });
         }
-        label_caps(ui, "Hat");
-        ui.horizontal_wrapped(|ui| {
-            for (i, n) in crate::scene::HAT_NAMES.iter().enumerate() {
-                let need = save::unlock_lv(Unlock::Hat(i as u8));
-                let locked = lv < need;
-                if seg(ui, n, app.save.profile.hat == i as u8, locked, 60.0).clicked() {
-                    if locked {
-                        note = Some(("hat".into(), need));
-                    } else {
-                        app.save.profile.hat = i as u8;
-                        changed = true;
-                    }
-                }
-            }
-        });
+        changed |= shop::locker(app, ui, w);
+        if app.sheet == Sheet::Shop {
+            return;
+        }
         label_caps(ui, "Voice");
         ui.horizontal_wrapped(|ui| {
             for (i, v) in save::VOICES.iter().enumerate() {

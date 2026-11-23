@@ -1,12 +1,16 @@
-//! The low-poly human (Quaternius "BaseHuman", CC0), loaded from the embedded GLB and posed
-//! from the game's simple procedural skeleton, the same way the JavaScript version did it:
-//! each mapped bone takes the world rotation of its skeleton joint, corrected so that the
-//! model's rest pose matches "limbs hanging straight down".
+//! The people: Quaternius' Universal Base Characters with his Modular Character Outfits (both CC0), made
+//! into `assets/people_m.glb`, `people_f.glb` and the texture atlas `people.png` by `tools/quaternius.py`:
+//! a rig per body (male, female), its head, hair styles and outfit parts as meshes, and posed from the
+//! game's simple procedural skeleton: each mapped bone takes the world rotation of its skeleton joint,
+//! corrected so that the rig's rest pose (a T-pose) matches "limbs hanging straight down". The game's
+//! poses were made for a shorter person; `scene::person` fits them to `Legs`.
 
+use crate::body;
 use glam::{Mat4, Quat, Vec3};
 
-pub const K: f32 = 0.375; // model units → metres
-pub const SK_HIP: f32 = crate::anim::STAND_HIP;
+pub const K: f32 = 1.0; // rig units → metres
+/// How much longer the arms are than the models' own (see `Rig::load`).
+const ARM: f32 = 1.2;
 
 /// Joint keys of the procedural skeleton (person-local rotations).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,21 +35,21 @@ pub const NKEYS: usize = 15;
 
 fn key_of(name: &str) -> Option<Key> {
     Some(match name {
-        "Bone" => Key::Root,
-        "Body" | "Hips" => Key::Hips,
-        "Abdomen" | "Torso" | "Shoulder.L" | "Shoulder.R" => Key::Spine,
-        "Neck" => Key::Neck,
+        "root" => Key::Root,
+        "pelvis" => Key::Hips,
+        "spine_01" | "spine_02" | "spine_03" | "clavicle_l" | "clavicle_r" => Key::Spine,
+        "neck_01" => Key::Neck,
         "Head" => Key::Head,
-        "UpperArm.R" => Key::Sh0,
-        "LowerArm.R" => Key::El0,
-        "Palm.R" | "MiddleHand.R" | "Fingers.R" | "Thumb1.R" | "Thumb2.R" => Key::Wr0,
-        "UpperArm.L" => Key::Sh1,
-        "LowerArm.L" => Key::El1,
-        "Palm.L" | "MiddleHand.L" | "Fingers.L" | "Thumb1.L" | "Thumb2.L" => Key::Wr1,
-        "UpperLeg.R" => Key::Hip0,
-        "LowerLeg.R" => Key::Knee0,
-        "UpperLeg.L" => Key::Hip1,
-        "LowerLeg.L" => Key::Knee1,
+        "upperarm_r" => Key::Sh0,
+        "lowerarm_r" => Key::El0,
+        "hand_r" => Key::Wr0,
+        "upperarm_l" => Key::Sh1,
+        "lowerarm_l" => Key::El1,
+        "hand_l" => Key::Wr1,
+        "thigh_r" => Key::Hip0,
+        "calf_r" => Key::Knee0,
+        "thigh_l" => Key::Hip1,
+        "calf_l" => Key::Knee1,
         _ => return None,
     })
 }
@@ -57,10 +61,11 @@ pub struct SkinVertex {
     pub nrm: [f32; 3],
     pub joints: [f32; 4],
     pub weights: [f32; 4],
-    pub mat: f32, // material slot
+    /// where in the atlas (`Model::atlas`)
+    pub uv: [f32; 2],
+    /// the slot of `SkinDraw.colors` its texels may take (by how much: the atlas' alpha), 255: none
+    pub slot: f32,
 }
-
-pub const MATS: [&str; 6] = ["Shirt", "Skin", "Pants", "Eyes", "Socks", "Hair"];
 
 struct Node {
     name: String,
@@ -71,61 +76,112 @@ struct Node {
     key: Option<Key>,
 }
 
+/// All the people's meshes, their rigs and their texture.
 pub struct Model {
     pub verts: Vec<SkinVertex>,
     pub indices: Vec<u32>,
+    /// index range (first, count) of every mesh, by rig and name
+    pub parts: Vec<(usize, String, u32, u32)>,
+    pub rigs: Vec<Rig>,
+    /// width, height, RGBA (sRGB colour; alpha: how much takes the person's colour)
+    pub atlas: (u32, u32, Vec<u8>),
+    pub stripe_f: f32,
+}
+
+/// One skeleton (male or female).
+pub struct Rig {
     nodes: Vec<Node>,
-    order: Vec<usize>, // parents before children
+    stretch: Vec<Vec3>, // per node: its own vertices stretched along it (the arms)
+    order: Vec<usize>,  // parents before children
     joints: Vec<usize>, // skin joint → node
     ibm: Vec<Mat4>,
     rest_q: Vec<Quat>,
     c: [Quat; NKEYS],
-    rel_foot: [(usize, usize, Mat4); 2], // (lower leg node, foot node, foot relative to lower leg)
+    feet_n: [usize; 2], // foot nodes, left and right
     off_body: Vec3,
     body: usize,
-    palm_r: usize,
+    hand_r: usize,
+    arm_r: [usize; 2],
     head: usize,
-    pub stripe_f: f32,
-    /// leg geometry in metres: thigh, shin, ankle height, hip joint offset (x, y below the hips point, z)
     pub legs: Legs,
 }
 
+/// Leg geometry in metres.
 #[derive(Clone, Copy, Debug)]
 pub struct Legs {
     pub thigh: f32,
     pub shin: f32,
     pub ankle: f32,
+    /// the hip joint's offset: sideways, below the hips point, forwards
     pub hip_x: f32,
     pub hip_drop: f32,
     pub hip_z: f32,
+    /// the hips point's height standing, and sitting on a 40 cm crate
+    pub stand: f32,
+    pub seat: f32,
 }
 
 pub struct Posed {
-    pub feet: [Vec3; 2],    // left, right ankle (foot bone) positions in world space
-    pub joints: Vec<Mat4>,  // world-space joint matrices (person transform folded in)
+    pub feet: [Vec3; 2],   // left, right ankle (foot bone) positions in world space
+    pub joints: Vec<Mat4>, // world-space joint matrices (person transform folded in)
     pub hand_r: Vec3,
-    pub head: Mat4,         // head frame in world space, metres, facing +Z
-}
-
-fn rd_f32(b: &[u8], o: usize) -> f32 {
-    f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    /// the right arm's shoulder and elbow joints (world)
+    pub arm_r: [Vec3; 2],
+    pub head: Mat4, // head frame in world space, metres, facing +Z
 }
 
 impl Model {
-    pub fn load(glb: &[u8]) -> Option<Model> {
+    /// The rigs' files in order (male, female) and the atlas (PNG).
+    pub fn load(glbs: &[&[u8]], png: &[u8]) -> Option<Model> {
+        let mut m = Model { verts: Vec::new(), indices: Vec::new(), parts: Vec::new(), rigs: Vec::new(), atlas: decode_png(png)?, stripe_f: K / 0.12 };
+        for (r, glb) in glbs.iter().enumerate() {
+            let rig = Rig::load(glb, r, &mut m)?;
+            m.rigs.push(rig);
+        }
+        Some(m)
+    }
+
+    /// What a person wearing this is drawn with: index ranges.
+    pub fn dress(&self, w: body::Wear) -> Vec<(u32, u32)> {
+        let rig = w.rig().min(self.rigs.len() - 1);
+        (0..body::SLOTS.len()).filter_map(|k| w.piece(k)).filter_map(|c| self.part(rig, &c.piece[2..])).collect()
+    }
+
+    /// The index range of a rig's mesh by name, if there is one.
+    pub fn part(&self, rig: usize, name: &str) -> Option<(u32, u32)> {
+        self.parts.iter().find(|p| p.0 == rig && p.1 == name).map(|p| (p.2, p.3))
+    }
+}
+
+/// A PNG as RGBA8.
+pub(crate) fn decode_png(png: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let mut dec = png::Decoder::new(std::io::Cursor::new(png));
+    dec.set_transformations(png::Transformations::EXPAND);
+    let mut r = dec.read_info().ok()?;
+    let mut buf = vec![0; r.output_buffer_size()?];
+    let info = r.next_frame(&mut buf).ok()?;
+    buf.truncate(info.buffer_size());
+    let px = match info.color_type {
+        png::ColorType::Rgba => buf,
+        png::ColorType::Rgb => buf.chunks(3).flat_map(|c| [c[0], c[1], c[2], 255]).collect(),
+        _ => return None,
+    };
+    Some((info.width, info.height, px))
+}
+
+impl Rig {
+    /// The rig, its meshes appended to `m` (vertices, indices, `parts`).
+    fn load(glb: &[u8], rig: usize, m: &mut Model) -> Option<Rig> {
         let jl = u32::from_le_bytes(glb[12..16].try_into().ok()?) as usize;
         let j: serde_json::Value = serde_json::from_slice(&glb[20..20 + jl]).ok()?;
-        let bin_off = 20 + jl + 8;
-        let bin = &glb[bin_off..];
+        let bin = &glb[20 + jl + 8..];
         let views = j["bufferViews"].as_array()?;
         let accs = j["accessors"].as_array()?;
-        // read an accessor as f32 components (handles normalized ints) or raw ints
-        let read = |ai: usize| -> (Vec<f32>, usize) {
+        // an accessor as f32s: floats, (normalized) bytes and shorts
+        let read = |ai: usize| -> Vec<f32> {
             let a = &accs[ai];
             let v = &views[a["bufferView"].as_u64().unwrap() as usize];
-            let ct = a["componentType"].as_u64().unwrap();
             let n = match a["type"].as_str().unwrap() {
-                "SCALAR" => 1,
                 "VEC2" => 2,
                 "VEC3" => 3,
                 "VEC4" => 4,
@@ -134,44 +190,23 @@ impl Model {
             };
             let count = a["count"].as_u64().unwrap() as usize;
             let norm = a["normalized"].as_bool().unwrap_or(false);
-            let csz = match ct {
-                5120 | 5121 => 1,
-                5122 | 5123 => 2,
-                _ => 4,
-            };
             let base = v["byteOffset"].as_u64().unwrap_or(0) as usize + a["byteOffset"].as_u64().unwrap_or(0) as usize;
-            let stride = v["byteStride"].as_u64().map(|s| s as usize).unwrap_or(n * csz);
-            let mut out = Vec::with_capacity(count * n);
-            for i in 0..count {
-                for k in 0..n {
-                    let o = base + i * stride + k * csz;
-                    let x = match ct {
-                        5120 => {
-                            let r = bin[o] as i8 as f32;
-                            if norm { (r / 127.0).max(-1.0) } else { r }
-                        }
-                        5121 => {
-                            let r = bin[o] as f32;
-                            if norm { r / 255.0 } else { r }
-                        }
-                        5122 => {
-                            let r = i16::from_le_bytes([bin[o], bin[o + 1]]) as f32;
-                            if norm { (r / 32767.0).max(-1.0) } else { r }
-                        }
-                        5123 => {
-                            let r = u16::from_le_bytes([bin[o], bin[o + 1]]) as f32;
-                            if norm { r / 65535.0 } else { r }
-                        }
-                        5125 => u32::from_le_bytes([bin[o], bin[o + 1], bin[o + 2], bin[o + 3]]) as f32,
-                        _ => rd_f32(bin, o),
-                    };
-                    out.push(x);
-                }
-            }
-            (out, n)
+            (0..count * n)
+                .map(|i| match a["componentType"].as_u64().unwrap() {
+                    5120 => {
+                        let x = bin[base + i] as i8 as f32;
+                        if norm { (x / 127.0).max(-1.0) } else { x }
+                    }
+                    5121 => bin[base + i] as f32 / if norm { 255.0 } else { 1.0 },
+                    5123 => u16::from_le_bytes([bin[base + i * 2], bin[base + i * 2 + 1]]) as f32 / if norm { 65535.0 } else { 1.0 },
+                    _ => f32::from_le_bytes(bin[base + i * 4..base + i * 4 + 4].try_into().unwrap()),
+                })
+                .collect()
         };
         // nodes
-        let jn = j["nodes"].as_array()?;
+        // the bones: the meshes' own nodes come after them
+        let all = j["nodes"].as_array()?;
+        let jn = &all[..all.iter().position(|n| n.get("mesh").is_some()).unwrap_or(all.len())];
         let mut nodes: Vec<Node> = jn
             .iter()
             .map(|n| {
@@ -187,6 +222,19 @@ impl Model {
             if let Some(ch) = n["children"].as_array() {
                 for c in ch {
                     nodes[c.as_u64().unwrap() as usize].parent = Some(i);
+                }
+            }
+        }
+        // longer arms than the models have (theirs are short for a person): the game's poses (a sip, picking
+        // up the can) are made for these; a longer bone moves what hangs off it, its own vertices stretch along
+        let mut stretch = vec![Vec3::ONE; nodes.len()];
+        for i in 0..nodes.len() {
+            if nodes[i].name.starts_with("upperarm_") || nodes[i].name.starts_with("lowerarm_") {
+                stretch[i] = Vec3::new(1.0, ARM, 1.0);
+                for c in 0..nodes.len() {
+                    if nodes[c].parent == Some(i) {
+                        nodes[c].t *= ARM;
+                    }
                 }
             }
         }
@@ -224,66 +272,60 @@ impl Model {
             c[k1 as usize] = q1;
             c[k2 as usize] = q2;
         };
-        chain("UpperArm.R", "LowerArm.R", "Palm.R", Key::Sh0, Key::El0);
-        chain("UpperArm.L", "LowerArm.L", "Palm.L", Key::Sh1, Key::El1);
-        chain("UpperLeg.R", "LowerLeg.R", "Foot.R", Key::Hip0, Key::Knee0);
-        chain("UpperLeg.L", "LowerLeg.L", "Foot.L", Key::Hip1, Key::Knee1);
+        chain("upperarm_r", "lowerarm_r", "hand_r", Key::Sh0, Key::El0);
+        chain("upperarm_l", "lowerarm_l", "hand_l", Key::Sh1, Key::El1);
+        chain("thigh_r", "calf_r", "foot_r", Key::Hip0, Key::Knee0);
+        chain("thigh_l", "calf_l", "foot_l", Key::Hip1, Key::Knee1);
         c[Key::Wr0 as usize] = c[Key::El0 as usize];
         c[Key::Wr1 as usize] = c[Key::El1 as usize];
-        let rel = |leg: &str, foot: &str| (idx(leg), idx(foot), g[idx(leg)].inverse() * g[idx(foot)]);
-        let rel_foot = [rel("LowerLeg.R", "Foot.R"), rel("LowerLeg.L", "Foot.L")];
-        let off_body = pos("Body") * K - Vec3::new(0.0, SK_HIP, 0.0);
+        let (hp, ul, ll, ft) = (pos("pelvis") * K, pos("thigh_r") * K, pos("calf_r") * K, pos("foot_r") * K);
+        // the hips point is where the game's skeleton has its hips: at the hip joints' height
+        let stand = ul.y;
+        // the pelvis goes where the pose puts the hips (this rig stands a little behind its origin)
+        let off_body = Vec3::new(hp.x, hp.y - stand, 0.0);
+        // sitting, the hip joints are a thigh's thickness above the seat (measured: `poses_touch_the_world`)
+        let seat = 0.4 + 0.132;
+        let legs = Legs { thigh: ul.distance(ll), shin: ll.distance(ft), ankle: ft.y, hip_x: ul.x.abs(), hip_drop: stand - ul.y, hip_z: ul.z - hp.z, stand, seat };
         // skin
         let skin = &j["skins"][0];
         let joints: Vec<usize> = skin["joints"].as_array()?.iter().map(|x| x.as_u64().unwrap() as usize).collect();
-        let (ib, _) = read(skin["inverseBindMatrices"].as_u64()? as usize);
-        let ibm: Vec<Mat4> = ib.chunks(16).map(Mat4::from_cols_slice).collect();
-        // mesh: all primitives merged, tagged with their material slot
-        let mut verts = Vec::new();
-        let mut indices = Vec::new();
-        let mut shirt_half = 0.0f32;
-        for p in j["meshes"][0]["primitives"].as_array()? {
-            let mname = j["materials"][p["material"].as_u64()? as usize]["name"].as_str().unwrap_or("");
-            let slot = MATS.iter().position(|m| *m == mname).unwrap_or(1) as f32;
-            let at = &p["attributes"];
-            let (ps, _) = read(at["POSITION"].as_u64()? as usize);
-            let (ns, _) = read(at["NORMAL"].as_u64()? as usize);
-            let (js, _) = read(at["JOINTS_0"].as_u64()? as usize);
-            let (ws, _) = read(at["WEIGHTS_0"].as_u64()? as usize);
-            let (is, _) = read(p["indices"].as_u64()? as usize);
-            let base = verts.len() as u32;
-            for i in 0..ps.len() / 3 {
-                let w = [ws[i * 4], ws[i * 4 + 1], ws[i * 4 + 2], ws[i * 4 + 3]];
-                let sum = (w[0] + w[1] + w[2] + w[3]).max(1e-6);
-                let n = Vec3::new(ns[i * 3], ns[i * 3 + 1], ns[i * 3 + 2]).normalize_or(Vec3::Y);
-                if slot == 0.0 {
-                    shirt_half = shirt_half.max(ps[i * 3].abs());
+        let ibm: Vec<Mat4> = read(skin["inverseBindMatrices"].as_u64()? as usize).chunks(16).map(Mat4::from_cols_slice).collect();
+        // every mesh, one after the other
+        for mesh in j["meshes"].as_array()? {
+            let first = m.indices.len() as u32;
+            for p in mesh["primitives"].as_array()? {
+                let at = &p["attributes"];
+                let get = |k: &str| at[k].as_u64().map(|a| read(a as usize));
+                let (ps, ns, js, ws, us, cs) = (get("POSITION")?, get("NORMAL")?, get("JOINTS_0")?, get("WEIGHTS_0")?, get("TEXCOORD_0")?, get("COLOR_0")?);
+                let base = m.verts.len() as u32;
+                for i in 0..ps.len() / 3 {
+                    m.verts.push(SkinVertex {
+                        pos: [ps[i * 3], ps[i * 3 + 1], ps[i * 3 + 2]],
+                        nrm: [ns[i * 3], ns[i * 3 + 1], ns[i * 3 + 2]],
+                        joints: [js[i * 4], js[i * 4 + 1], js[i * 4 + 2], js[i * 4 + 3]],
+                        weights: [ws[i * 4], ws[i * 4 + 1], ws[i * 4 + 2], ws[i * 4 + 3]],
+                        uv: [us[i * 2], us[i * 2 + 1]],
+                        slot: cs[i * 4],
+                    });
                 }
-                verts.push(SkinVertex {
-                    pos: [ps[i * 3], ps[i * 3 + 1], ps[i * 3 + 2]],
-                    nrm: n.to_array(),
-                    joints: [js[i * 4], js[i * 4 + 1], js[i * 4 + 2], js[i * 4 + 3]],
-                    weights: [w[0] / sum, w[1] / sum, w[2] / sum, w[3] / sum],
-                    mat: slot,
-                });
+                m.indices.extend(read(p["indices"].as_u64()? as usize).iter().map(|x| *x as u32 + base));
             }
-            indices.extend(is.iter().map(|x| *x as u32 + base));
+            m.parts.push((rig, mesh["name"].as_str().unwrap_or("").to_string(), first, m.indices.len() as u32 - first));
         }
-        let (ul, ll, ft) = (pos("UpperLeg.R") * K, pos("LowerLeg.R") * K, pos("Foot.R") * K);
-        let legs = Legs { thigh: ul.distance(ll), shin: ll.distance(ft), ankle: ft.y, hip_x: ul.x.abs(), hip_drop: SK_HIP - ul.y, hip_z: ul.z };
-        let body = idx("Body");
-        let palm_r = idx("MiddleHand.R");
-        let head = idx("Head");
-        Some(Model { verts, indices, nodes, order, joints, ibm, rest_q, c, rel_foot, off_body, body, palm_r, head, stripe_f: if shirt_half > 0.0 { 11.0 / shirt_half } else { 13.5 }, legs })
+        let (body, hand_r, head) = (idx("pelvis"), idx("hand_r"), idx("Head"));
+        let arm_r = [idx("upperarm_r"), idx("lowerarm_r")];
+        let feet_n = [idx("foot_l"), idx("foot_r")];
+        Some(Rig { nodes, stretch, order, joints, ibm, rest_q, c, feet_n, off_body, body, hand_r, arm_r, head, legs })
     }
 
     pub fn joint_count(&self) -> usize {
         self.joints.len()
     }
 
-    /// Pose the model. `j` holds person-local joint rotations, `hips` the person-local hip position
-    /// (metres), `person` the person's world transform (position and yaw).
-    pub fn pose(&self, j: &[Quat; NKEYS], hips: Vec3, person: Mat4, feet: Quat) -> Posed {
+    /// Pose the rig. `j` holds person-local joint rotations, `hips` the person-local hip position
+    /// (metres), `person` the person's world transform (position and yaw). `build` widens or narrows
+    /// body parts (`body::Build`): each bone's own vertices, not what hangs off it.
+    pub fn pose(&self, j: &[Quat; NKEYS], hips: Vec3, person: Mat4, feet: Quat, build: &body::Build) -> Posed {
         let n = self.nodes.len();
         let mut g = vec![Mat4::IDENTITY; n];
         for &i in &self.order {
@@ -299,49 +341,58 @@ impl Model {
                     }
                     g[i] = Mat4::from_scale_rotation_translation(ps * nd.s, wq, t);
                 }
+                // the foot hangs off the shin but stays level with the ground
+                None if self.feet_n.contains(&i) => {
+                    let (sc, _, tr) = (pg * Mat4::from_scale_rotation_translation(nd.s, nd.r, nd.t)).to_scale_rotation_translation();
+                    g[i] = Mat4::from_scale_rotation_translation(sc, feet * self.rest_q[i], tr);
+                }
                 None => g[i] = pg * Mat4::from_scale_rotation_translation(nd.s, nd.r, nd.t),
             }
         }
-        for (leg, foot, rel) in self.rel_foot {
-            // the foot hangs off the shin but stays level with the ground
-            let (sc, _, tr) = (g[leg] * rel).to_scale_rotation_translation();
-            g[foot] = Mat4::from_scale_rotation_translation(sc, feet * self.rest_q[foot], tr);
-        }
         let pk = person * Mat4::from_scale(Vec3::splat(K));
-        let joints = self.joints.iter().zip(self.ibm.iter()).map(|(&nd, ib)| pk * g[nd] * *ib).collect();
-        let hand_r = pk.transform_point3(g[self.palm_r].transform_point3(Vec3::ZERO));
-        let feet = [pk.transform_point3(g[self.rel_foot[1].1].transform_point3(Vec3::ZERO)), pk.transform_point3(g[self.rel_foot[0].1].transform_point3(Vec3::ZERO))];
-        let (_, hq, ht) = g[self.head].to_scale_rotation_translation();
-        let _ = hq;
+        let joints = self.joints.iter().zip(self.ibm.iter()).map(|(&nd, ib)| pk * g[nd] * Mat4::from_scale(build.scale_of(&self.nodes[nd].name) * self.stretch[nd]) * *ib).collect();
+        let hand_r = pk.transform_point3(g[self.hand_r].transform_point3(Vec3::ZERO));
+        let feet = [pk.transform_point3(g[self.feet_n[0]].transform_point3(Vec3::ZERO)), pk.transform_point3(g[self.feet_n[1]].transform_point3(Vec3::ZERO))];
+        let ht = g[self.head].transform_point3(Vec3::ZERO);
         // the head frame: at the head bone, oriented like the person's head joint (+Z forward)
         let head = person * Mat4::from_rotation_translation(j[Key::Head as usize], ht * K);
-        Posed { feet, joints, hand_r, head }
+        let arm_r = self.arm_r.map(|n| pk.transform_point3(g[n].transform_point3(Vec3::ZERO)));
+        Posed { feet, joints, hand_r, arm_r, head }
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    pub fn load() -> Model {
+        Model::load(&[include_bytes!("../assets/people_m.glb"), include_bytes!("../assets/people_f.glb")], include_bytes!("../assets/people.png")).unwrap()
+    }
     #[test]
     fn rest_pose_proportions() {
-        let m = Model::load(include_bytes!("../assets/person.glb")).unwrap();
-        let p = m.pose(&[Quat::IDENTITY; NKEYS], Vec3::new(0.0, SK_HIP, 0.0), Mat4::IDENTITY, Quat::IDENTITY);
-        let head = p.head.transform_point3(Vec3::ZERO);
-        println!("joints {} hand {:?} head {:?} stripe {}", m.joint_count(), p.hand_r, head, m.stripe_f);
-        // a standing adult: hand at hip height on the right (-X), head bone high up
-        assert!(p.hand_r.y > 0.6 && p.hand_r.y < 1.0 && p.hand_r.x < -0.1, "hand {:?}", p.hand_r);
-        assert!(head.y > 1.35 && head.y < 1.75, "head {:?}", head);
-        // every vertex ends up within a person-sized box
-        let (mut lo, mut hi) = (Vec3::splat(9.0), Vec3::splat(-9.0));
-        for v in &m.verts {
-            let mut w = Vec3::ZERO;
-            for k in 0..4 {
-                w += p.joints[v.joints[k] as usize].transform_point3(Vec3::from_array(v.pos)) * v.weights[k];
+        let m = load();
+        for (r, rig) in m.rigs.iter().enumerate() {
+            let p = rig.pose(&[Quat::IDENTITY; NKEYS], Vec3::new(0.0, rig.legs.stand, 0.0), Mat4::IDENTITY, Quat::IDENTITY, &body::BUILDS[0]);
+            let head = p.head.transform_point3(Vec3::ZERO);
+            println!("rig {r}: joints {} hand {:?} head {:?} legs {:?}", rig.joint_count(), p.hand_r, head, rig.legs);
+            // standing: hand by the hip on the right (-X), the head bone up high
+            assert!(p.hand_r.y > 0.6 && p.hand_r.y < 1.1 && p.hand_r.x < -0.1, "hand {:?}", p.hand_r);
+            assert!(head.y > 1.4 && head.y < 1.8, "head {:?}", head);
+            // the head and shoes end up in a person-sized box, the soles on the ground
+            let (mut lo, mut hi) = (Vec3::splat(9.0), Vec3::splat(-9.0));
+            for name in ["Casual_Head", "Casual_Feet"] {
+                let (first, n) = m.part(r, name).unwrap();
+                for &i in &m.indices[first as usize..(first + n) as usize] {
+                    let v = &m.verts[i as usize];
+                    let mut w = Vec3::ZERO;
+                    for k in 0..4 {
+                        w += p.joints[v.joints[k] as usize].transform_point3(Vec3::from_array(v.pos)) * v.weights[k];
+                    }
+                    lo = lo.min(w);
+                    hi = hi.max(w);
+                }
             }
-            lo = lo.min(w);
-            hi = hi.max(w);
+            println!("bbox {lo:?} {hi:?}");
+            assert!(lo.y > -0.05 && lo.y < 0.05 && hi.y < 2.0 && hi.y > 1.6, "bbox {lo:?} {hi:?}");
         }
-        println!("bbox {lo:?} {hi:?}");
-        assert!(lo.y > -0.05 && hi.y < 1.95 && hi.y > 1.5);
     }
 }

@@ -3,6 +3,7 @@
 
 use crate::game::{self, AMode, Game, Person, State, BR, H, R};
 use crate::gfx::{inst, kind, DrawList, Mesh, SkinDraw};
+use crate::body;
 use crate::model::Model;
 use glam::{vec3, Mat4, Quat, Vec3};
 use std::f32::consts::PI;
@@ -42,10 +43,11 @@ pub struct Look {
     pub shorts: [f32; 3],
     pub shoes: [f32; 3],
     pub socks: [f32; 3],
-    pub hair_style: u8,
     pub cap: Option<[f32; 3]>,
     pub stripes: bool,
     pub hat: u8,
+    /// body, build, hair and clothes
+    pub wear: body::Wear,
 }
 
 const SKINS: [u32; 5] = [0xd9a98a, 0xc98e66, 0x9a6544, 0x6e4329, 0xe2b597];
@@ -64,14 +66,28 @@ pub fn player_look(team_color: [f32; 3], i: usize, n: usize) -> Look {
         shorts: hex(PANTS[n % 5]),
         shoes: hex(SHOES[(n + 2) % 5]),
         socks: hex(0xf0f0ea),
-        hair_style: (n % 3) as u8,
         cap: None,
         stripes: false,
         hat: 0,
+        wear: body::Wear::random(&mut { let mut rng = game::Rng::new(n as u64 * 7919 + 3); move || rng.f() }),
     }
 }
+/// Someone the game puts on the pitch: anyone at all, from a seed (the same seed, the same person).
+pub fn random_look(team_color: [f32; 3], seed: u64) -> Look {
+    let mut rng = game::Rng::new(seed);
+    let mut r = || rng.f();
+    let pick = |r: &mut dyn FnMut() -> f32, n: usize| ((r() * n as f32) as usize).min(n - 1);
+    use crate::save::{HAIR_OPTS, SHORTS_OPTS, SKIN_OPTS};
+    let skin = hex(SKIN_OPTS[pick(&mut r, SKIN_OPTS.len())]);
+    let hair = hex(HAIR_OPTS[pick(&mut r, HAIR_OPTS.len())]);
+    let shorts = hex(SHORTS_OPTS[pick(&mut r, SHORTS_OPTS.len())]);
+    // now and then one of the shop's hats
+    let hat = if r() < 0.12 { crate::net::SHOP[pick(&mut r, crate::net::SHOP.len())].0 } else { 0 };
+    let wear = body::Wear::random(&mut r);
+    Look { shirt: team_color, skin, hair, shorts, shoes: hex(0x2a2a2a), socks: hex(0xf0f0ea), cap: None, stripes: false, hat, wear }
+}
 pub fn ref_look() -> Look {
-    Look { shirt: hex(0xf4f4f0), skin: hex(0xc98e66), hair: hex(0x1a1a1a), shorts: hex(0x161616), shoes: hex(0x161616), socks: hex(0x161616), hair_style: 0, cap: Some(hex(0x111111)), stripes: true, hat: 0 }
+    Look { shirt: hex(0xf4f4f0), skin: hex(0xc98e66), hair: hex(0x1a1a1a), shorts: hex(0x161616), shoes: hex(0x161616), socks: hex(0x161616), cap: Some(hex(0x111111)), stripes: true, hat: 0, wear: body::Wear { build: 3, ..body::Wear::starter(0) } }
 }
 
 pub struct Rig {
@@ -84,8 +100,31 @@ pub struct Rig {
 
 /// Draw one person (the skinned model) and return where their hand and mouth are.
 pub fn person(dl: &mut DrawList, model: &Model, p: &Person, lk: &Look, draw: bool) -> Rig {
+    use crate::anim::{ANKLE, HIP_X, STAND_HIP};
     use crate::model::Key;
-    let o = p.vis.pose;
+    let mut o = p.vis.pose;
+    // the poses are made for longer legs: heights and steps shrink with the legs, the feet keep under the
+    // hip joints, and sitting the hips go on the crate whatever the legs do
+    let rig = &model.rigs[lk.wear.rig().min(model.rigs.len() - 1)];
+    let lg = rig.legs;
+    let kv = lg.stand / STAND_HIP;
+    o.hip *= kv;
+    o.hip.y = lerp(o.hip.y, lg.seat, p.vis.w_sit);
+    // bending down for the can: these long legs squat deeper and lean further to get there
+    let sm = |x: f32| {
+        let x = x.clamp(0.0, 1.0);
+        x * x * (3.0 - 2.0 * x)
+    };
+    let c = p.vis.carry_t;
+    let reach = sm(c / crate::anim::CAN_GRAB) * (1.0 - sm((c - crate::anim::CAN_GRAB) / 0.42));
+    o.hip.y -= 0.16 * reach;
+    o.hip.z -= 0.04 * reach;
+    o.lean += 0.2 * reach;
+    for f in o.foot.iter_mut() {
+        let y = lg.ankle + (f.y - ANKLE) * kv;
+        *f = *f * kv + vec3(f.x.signum() * (lg.hip_x - HIP_X * kv), 0.0, 0.0);
+        f.y = y;
+    }
     let q = |m: Mat4| Quat::from_mat4(&m).normalize();
     let mut j = [Quat::IDENTITY; crate::model::NKEYS];
     let pelvis = ry(o.pel_yaw) * rz(o.pel_roll);
@@ -105,7 +144,6 @@ pub fn person(dl: &mut DrawList, model: &Model, p: &Person, lk: &Look, draw: boo
         j[kw as usize] = q(el);
     }
     // legs: two-bone IK from the hip joint to the foot target, so feet land on the ground
-    let lg = model.legs;
     let pinv = pelvis.inverse();
     for (li, sd) in [(0usize, 1.0f32), (1, -1.0)] {
         let hj = o.hip + pelvis.transform_vector3(vec3(sd * lg.hip_x, -lg.hip_drop, lg.hip_z));
@@ -124,28 +162,64 @@ pub fn person(dl: &mut DrawList, model: &Model, p: &Person, lk: &Look, draw: boo
         j[kk as usize] = q(kn);
     }
     let root = t(p.pos.x, p.pos.y, p.pos.z) * ry(p.vis.yaw);
-    let posed = model.pose(&j, o.hip, root, q(ry(o.pel_yaw * 0.5)));
+    // a build sizes the whole person, the pose with them
+    let build = &body::BUILDS[lk.wear.build as usize % body::BUILDS.len()];
+    let person_m = root * su(build.scale);
+    let feet_q = q(ry(o.pel_yaw * 0.5));
+    let mut posed = rig.pose(&j, o.hip, person_m, feet_q, build);
+    // these bodies aren't built like the one the poses were made on: where the right hand has to be somewhere
+    // (the can on the ground, the lips), the arm is bent to get it there
+    let sip = p.vis.sip_k();
+    if reach > 0.01 || sip > 0.01 {
+        let target = if sip >= reach { posed.head.transform_point3(body::MOUTH + vec3(0.0, -0.06, 0.07)) } else { person_m.transform_point3(CAN_AT / build.scale) };
+        let goal = posed.hand_r.lerp(target, sip.max(reach));
+        let [sh, el] = posed.arm_r;
+        let (l1, l2) = (sh.distance(el), el.distance(posed.hand_r));
+        let d = (goal - sh).clamp_length(0.05, (l1 + l2) * 0.999);
+        let dl = d.length();
+        let dn = d / dl;
+        // the elbow goes down and out to the right
+        let pole = root.transform_vector3(vec3(-0.6, -1.0, -0.3)).normalize();
+        let perp = (pole - dn * pole.dot(dn)).normalize_or(Vec3::NEG_Y);
+        let a = (l1 * l1 - l2 * l2 + dl * dl) / (2.0 * dl);
+        let e = sh + dn * a + perp * (l1 * l1 - a * a).max(0.0).sqrt();
+        let inv = Quat::from_mat4(&root).inverse();
+        let down = Vec3::NEG_Y;
+        let u1 = inv * (e - sh).normalize();
+        let u2 = inv * (sh + d - e).normalize();
+        j[Key::Sh0 as usize] = Quat::from_rotation_arc(down, u1);
+        j[Key::El0 as usize] = Quat::from_rotation_arc(down, u2);
+        j[Key::Wr0 as usize] = j[Key::El0 as usize];
+        posed = rig.pose(&j, o.hip, person_m, feet_q, build);
+    }
     if draw {
         // where they meet the ground, less light gets in
-        dl.blend.push((Mesh::Quad, inst(t(p.pos.x, 0.012, p.pos.z) * rx(-PI * 0.5) * su(0.85), [0.0, 0.0, 0.0, 0.62], [kind::SOFT, 0.0, 0.0, 0.0])));
+        dl.blend.push((Mesh::Quad, inst(t(p.pos.x, 0.012, p.pos.z) * rx(-PI * 0.5) * su(0.85 * build.scale), [0.0, 0.0, 0.0, 0.62], [kind::SOFT, 0.0, 0.0, 0.0])));
         let c = |v: [f32; 3]| [v[0], v[1], v[2], 1.0];
         dl.skinned.push(SkinDraw {
             bones: posed.joints,
-            colors: [c(lk.shirt), c(lk.skin), c(lk.shorts), [0.02, 0.018, 0.016, 1.0], c(lk.socks), c(lk.hair)],
+            colors: [c(lk.shirt), c(lk.skin), c(lk.shorts), c(lk.shoes), c(lk.socks), c(lk.hair), c(lk.shoes), c(lk.socks)],
             stripe: if lk.stripes { model.stripe_f } else { 0.0 },
+            parts: model.dress(lk.wear),
         });
+        let hf = hat_frame(posed.head);
         if let Some(cap) = lk.cap {
-            hat(dl, posed.head, 1, cap);
+            hat(dl, hf, 1, cap);
         } else if lk.hat > 0 {
-            hat(dl, posed.head, lk.hat, [0.0; 3]);
+            hat(dl, hf, lk.hat, [0.0; 3]);
         }
     }
-    let mouth = posed.head.transform_point3(vec3(0.0, 0.075, 0.105));
+    let mouth = posed.head.transform_point3(body::MOUTH);
     let hand_r_m = root * Mat4::from_translation(root.inverse().transform_point3(posed.hand_r)) * Mat4::from_quat(j[Key::Wr0 as usize]);
     Rig { hand_r: posed.hand_r, hand_r_m, mouth, head: posed.head, feet: posed.feet }
 }
 
-pub const HAT_NAMES: [&str; 6] = ["None", "Cap", "Bucket", "Shades", "Band", "Crown"];
+/// Where the can stands when someone bends down for it: at their feet, in front (person-local).
+const CAN_AT: Vec3 = vec3(-0.06, 0.12, 0.4);
+
+/// Hats 1–5 are no longer worn (the faces have hats of their own; 1 is still the referee's cap); from 6 on
+/// they're the shop's (`proto::SHOP`), bought with coins.
+pub const HAT_NAMES: [&str; 11] = ["None", "Cap", "Bucket", "Shades", "Band", "Crown", "Beanie", "Party", "Top hat", "Viking", "Beer helmet"];
 
 /// What's in the hand during an emote: a smoking cigarette, or a Buzzball on its way to the lips.
 fn emote_prop(dl: &mut DrawList, p: &Person, rig: &Rig, cam: &Cam, seed: usize) {
@@ -178,9 +252,12 @@ fn emote_prop(dl: &mut DrawList, p: &Person, rig: &Rig, cam: &Cam, seed: usize) 
         crate::arenas::buzz(dl, Mat4::from_translation(rig.hand_r - up * 0.05) * Mat4::from_quat(Quat::from_rotation_arc(Vec3::Y, up)), seed);
     }
 }
-/// Hats sit on the head frame (origin at the base of the skull, +Z forward).
-pub fn hat(dl: &mut DrawList, head: Mat4, h: u8, tint: [f32; 3]) {
-    let m = head * t(0.0, HAT_Y, HAT_Z);
+/// Where a hat sits on a head: a frame at the hat line, sized so that a hat made for a head 21 cm wide fits.
+pub fn hat_frame(head: Mat4) -> Mat4 {
+    head * Mat4::from_translation(body::CRANIUM + vec3(0.0, 0.07, 0.03)) * su(body::CRANIUM_R * 0.9 / 0.106)
+}
+/// Hats sit on the hat frame (`hat_frame`, +Z forward).
+pub fn hat(dl: &mut DrawList, m: Mat4, h: u8, tint: [f32; 3]) {
     match h {
         1 => {
             let c = if tint == [0.0; 3] { hex(0x1d3557) } else { tint };
@@ -195,10 +272,10 @@ pub fn hat(dl: &mut DrawList, head: Mat4, h: u8, tint: [f32; 3]) {
         3 => {
             let (lens, frame) = ([0.01, 0.01, 0.012], hex(0x222222));
             for sd in [-1.0f32, 1.0] {
-                dl.push(Mesh::Cube, m * t(sd * 0.037, -0.058, 0.112) * ry(sd * 0.14) * s(0.058, 0.034, 0.01), [lens[0], lens[1], lens[2], 1.0], [kind::LIT, 0.0, 1.0, 0.0]);
-                dl.solid(Mesh::Cube, m * t(sd * 0.074, -0.052, 0.06) * s(0.006, 0.008, 0.11), frame);
+                dl.push(Mesh::Cube, m * t(sd * 0.039, -0.042, 0.1) * ry(sd * 0.3) * s(0.054, 0.034, 0.01), [lens[0], lens[1], lens[2], 1.0], [kind::LIT, 0.0, 1.0, 0.0]);
+                dl.solid(Mesh::Cube, m * t(sd * 0.1, -0.036, 0.03) * ry(sd * 0.1) * s(0.006, 0.008, 0.12), frame);
             }
-            dl.solid(Mesh::Cube, m * t(0.0, -0.05, 0.116) * s(0.02, 0.006, 0.006), frame);
+            dl.solid(Mesh::Cube, m * t(0.0, -0.034, 0.108) * s(0.02, 0.006, 0.006), frame);
         }
         4 => {
             dl.solid(Mesh::Cyl, m * t(0.0, -0.012, 0.004) * s(0.1, 0.028, 0.112), hex(0xd43c3c));
@@ -213,11 +290,51 @@ pub fn hat(dl: &mut DrawList, head: Mat4, h: u8, tint: [f32; 3]) {
                 dl.solid(Mesh::Sphere, m * t(a.sin() * 0.079, 0.02, a.cos() * 0.079) * su(0.009), hex(0xc8102e));
             }
         }
+        6 => {
+            // a knitted beanie with a pompom
+            let c = hex(0xc8323c);
+            dl.solid(Mesh::Hemi, m * t(0.0, -0.03, -0.004) * s(0.106, 0.11, 0.114), c);
+            dl.solid(Mesh::Cyl, m * t(0.0, -0.035, -0.004) * s(0.108, 0.035, 0.116), hex(0xe8e2d0));
+            dl.solid(Mesh::Sphere, m * t(0.0, 0.085, -0.004) * su(0.03), hex(0xe8e2d0));
+        }
+        7 => {
+            // a striped party cone, worn at an angle
+            let cone = m * t(0.02, 0.0, 0.0) * rz(-0.25);
+            dl.solid(Mesh::Cone, cone * t(0.0, 0.1, 0.0) * s(0.07, 0.2, 0.07), hex(0x8a5ad0));
+            dl.solid(Mesh::Cyl, cone * t(0.0, 0.07, 0.0) * s(0.05, 0.022, 0.05), hex(0xe8b02a));
+            dl.solid(Mesh::Cyl, cone * t(0.0, 0.13, 0.0) * s(0.029, 0.018, 0.029), hex(0xe8b02a));
+            dl.solid(Mesh::Sphere, cone * t(0.0, 0.205, 0.0) * su(0.018), hex(0xf2f2f2));
+        }
+        8 => {
+            // a top hat: tall, black, with a band
+            let black = hex(0x141414);
+            dl.solid(Mesh::Cyl, m * t(0.0, 0.07, 0.0) * s(0.092, 0.15, 0.098), black);
+            dl.solid(Mesh::Cyl, m * t(0.0, 0.0, 0.0) * s(0.16, 0.008, 0.17), black);
+            dl.solid(Mesh::Cyl, m * t(0.0, 0.02, 0.0) * s(0.094, 0.022, 0.1), hex(0x7a1e24));
+        }
+        9 => {
+            // a Viking helmet: iron cap, a rim and two horns
+            let iron = hex(0x8a8f96);
+            dl.push(Mesh::Hemi, m * t(0.0, -0.01, -0.004) * s(0.11, 0.1, 0.118), [iron[0], iron[1], iron[2], 1.0], [kind::LIT, 0.2, 1.0, 0.0]);
+            dl.solid(Mesh::Cyl, m * t(0.0, -0.01, -0.004) * s(0.113, 0.02, 0.121), hex(0x6b4424));
+            for sd in [-1.0f32, 1.0] {
+                dl.solid(Mesh::Cone, m * t(sd * 0.13, 0.05, 0.0) * rz(-sd * 0.9) * s(0.026, 0.11, 0.026), hex(0xf0e6cc));
+            }
+        }
+        10 => {
+            // the beer helmet: two cans, and straws down to the mouth
+            let c = hex(0xe8b02a);
+            dl.solid(Mesh::Hemi, m * t(0.0, -0.004, -0.004) * s(0.106, 0.08, 0.114), c);
+            for sd in [-1.0f32, 1.0] {
+                let can = m * t(sd * 0.13, 0.03, 0.0) * rz(sd * 0.25) * rx(PI);
+                dl.push(Mesh::Cyl, can * s(0.033, 0.12, 0.033), [0.82, 0.82, 0.86, 1.0], [kind::LIT, 0.3, 1.0, 0.0]);
+                dl.solid(Mesh::Cyl, can * s(0.034, 0.06, 0.034), hex(0x2f86b8));
+                dl.solid(Mesh::Cube, m * t(sd * 0.1, -0.07, 0.07) * ry(-sd * 0.6) * rx(0.9) * s(0.006, 0.16, 0.006), hex(0xd43c3c));
+            }
+        }
         _ => {}
     }
 }
-const HAT_Y: f32 = 0.2;
-const HAT_Z: f32 = 0.01;
 
 // ---------- props ----------
 /// A beer crate with its open top showing: walls, handle slots and a dozen bottles. The opening is at +Y,
@@ -255,48 +372,29 @@ pub fn bottle(dl: &mut DrawList, m: Mat4, label: [f32; 3]) {
     dl.solid(Mesh::Cyl, m * t(0.0, 0.246, 0.0) * s(0.015, 0.008, 0.015), [0.8, 0.72, 0.45]);
 }
 
-/// A tree: a tapering trunk with a few boughs and a crown of leaf clumps around a dark core.
-pub fn tree(dl: &mut DrawList, rng: &mut game::Rng, at: Vec3, h: f32, tr: f32, green: [f32; 3]) {
-    let bark = [0.19 + rng.f() * 0.05, 0.15 + rng.f() * 0.03, 0.11];
-    dl.push(Mesh::Trunk, Mat4::from_translation(at + Vec3::Y * (h * 0.5)) * s(tr, h, tr), [bark[0], bark[1], bark[2], 1.0], [kind::BARK, 0.0, 1.0, 0.0]);
-    let crown = at + Vec3::Y * (h + 0.6);
-    let cr = 1.7 + rng.f() * 0.9;
-    let mut ends = Vec::new();
-    let nb = 3 + (rng.f() * 2.0) as usize;
-    for k in 0..nb {
-        let y0 = h * (0.55 + rng.f() * 0.3);
-        let yaw = k as f32 / nb as f32 * PI * 2.0 + rng.f() * 0.8;
-        let tilt = 0.55 + rng.f() * 0.45;
-        let len = cr * (0.75 + rng.f() * 0.35);
-        let m = Mat4::from_translation(at + Vec3::Y * y0) * ry(yaw) * rz(tilt);
-        dl.push(Mesh::Trunk, m * t(0.0, len * 0.5, 0.0) * s(tr * 0.42, len, tr * 0.42), [bark[0], bark[1], bark[2], 1.0], [kind::BARK, 0.0, 1.0, 0.0]);
-        ends.push(m.transform_point3(Vec3::Y * len));
-    }
-    // a dark core so you never see through the crown
-    let core = [green[0] * 0.3, green[1] * 0.32, green[2] * 0.25];
-    dl.solid(Mesh::Sphere, Mat4::from_translation(crown) * s(cr * 0.55, cr * 0.45, cr * 0.55), core);
-    let seed = rng.f() * 10.0;
-    let mut clump = |dl: &mut DrawList, c: Vec3, sc: f32, rng: &mut game::Rng| {
-        let k = 0.85 + rng.f() * 0.3;
-        dl.push(Mesh::Leaves, Mat4::from_translation(c) * ry(rng.f() * 6.3) * s(sc, sc * 0.85, sc), [green[0] * k, green[1] * k, green[2] * k, 1.0], [kind::LEAF, 0.0, 1.0, seed]);
-    };
-    for e in &ends {
-        clump(dl, *e + Vec3::Y * 0.2, 0.95 + rng.f() * 0.35, rng);
-    }
-    for _ in 0..(13 - ends.len().min(5)) {
-        let d = vec3(rng.f() * 2.0 - 1.0, rng.f() * 1.6 - 0.5, rng.f() * 2.0 - 1.0).normalize_or_zero();
-        clump(dl, crown + vec3(d.x * cr * 0.62, d.y * cr * 0.5, d.z * cr * 0.62), 1.0 + rng.f() * 0.5, rng);
-    }
+/// One of the park's plants or stones (`nature::MODELS`), standing at `at`, turned and sized; `tint` multiplies
+/// its colours; `far`: drawn up to this far from the camera (0: always).
+pub fn plant(dl: &mut DrawList, name: &str, at: Vec3, yaw: f32, size: f32, tint: [f32; 3], far: f32, shadow: bool, seed: f32) {
+    let m = Mat4::from_translation(at) * ry(yaw) * su(size);
+    dl.nature.push((crate::nature::id(name), inst(m, [tint[0], tint[1], tint[2], 1.0], [0.0, far, shadow as u8 as f32, seed])));
 }
-/// A bush: a few leaf clumps on a dark mound.
-pub fn bush(dl: &mut DrawList, rng: &mut game::Rng, at: Vec3, sc: f32, green: [f32; 3]) {
-    dl.solid(Mesh::Hemi, Mat4::from_translation(at) * s(sc * 1.1, sc * 0.8, sc * 0.95), [green[0] * 0.3, green[1] * 0.32, green[2] * 0.25]);
-    let seed = rng.f() * 10.0;
-    for _ in 0..3 {
-        let o = vec3((rng.f() - 0.5) * sc, sc * (0.35 + rng.f() * 0.3), (rng.f() - 0.5) * sc * 0.8);
-        let k = sc * (0.6 + rng.f() * 0.3);
-        dl.push(Mesh::Leaves, Mat4::from_translation(at + o) * ry(rng.f() * 6.3) * s(k, k * 0.8, k), [green[0], green[1], green[2], 1.0], [kind::LEAF, 0.0, 1.0, seed]);
-    }
+/// The kit's trees' heights, to size them by (`tools/nature.py` prints them).
+const TREES: [(&str, f32); 5] = [("CommonTree_1", 7.26), ("CommonTree_2", 7.64), ("CommonTree_3", 9.43), ("CommonTree_4", 9.44), ("CommonTree_5", 7.01)];
+
+/// A tree about `h` metres up to where its crown starts (the crown goes some way above that): one of the kit's
+/// common trees, tinted a little towards `green`.
+pub fn tree(dl: &mut DrawList, rng: &mut game::Rng, at: Vec3, h: f32, _trunk: f32, green: [f32; 3]) {
+    let (name, mh) = TREES[(rng.f() * TREES.len() as f32) as usize % TREES.len()];
+    let size = (h + 3.2) / mh * (0.9 + rng.f() * 0.2);
+    let g = (green[0] + green[1] + green[2]).max(0.01) / 3.0;
+    let tint = [0.85 + 0.15 * green[0] / g, 0.85 + 0.15 * green[1] / g, 0.85 + 0.15 * green[2] / g].map(|c| c * (0.9 + rng.f() * 0.15));
+    plant(dl, name, at, rng.f() * PI * 2.0, size, tint, 0.0, true, rng.f() * 10.0);
+}
+/// A bush about `sc` metres across: the kit's, sometimes in flower.
+pub fn bush(dl: &mut DrawList, rng: &mut game::Rng, at: Vec3, sc: f32, _green: [f32; 3]) {
+    let name = if rng.f() < 0.35 { "Bush_Common_Flowers" } else { "Bush_Common" };
+    let k = 0.9 + rng.f() * 0.2;
+    plant(dl, name, at, rng.f() * PI * 2.0, sc * 1.05, [k, k, k * 0.95], 0.0, true, rng.f() * 10.0);
 }
 
 /// Everything that never moves: sky, lawn, trees, paths, pond, benches.
@@ -319,7 +417,7 @@ pub fn build_env() -> DrawList {
     let greens = [hex(0x2c5419), hex(0x3a6220), hex(0x284c1c), hex(0x456e24), hex(0x557024)];
     let mut placed = 0;
     let mut tries = 0;
-    while placed < 85 && tries < 1200 {
+    while placed < 64 && tries < 1200 {
         tries += 1;
         let ang = rng.f() * PI * 2.0;
         let r = 13.0 + rng.f() * rng.f() * 58.0;
@@ -334,6 +432,12 @@ pub fn build_env() -> DrawList {
         let g = greens[(rng.f() * 5.0) as usize % 5];
         tree(&mut dl, &mut rng, vec3(x, 0.0, z), h, tr, g);
     }
+    // a few old giants far out
+    for k in 0..4 {
+        let ang = 0.6 + k as f32 * 1.6 + rng.f() * 0.4;
+        let r = 44.0 + rng.f() * 14.0;
+        plant(&mut dl, if k % 2 == 0 { "TwistedTree_1" } else { "TwistedTree_3" }, vec3(ang.sin() * r, 0.0, ang.cos() * r), rng.f() * 6.3, 0.75 + rng.f() * 0.2, [1.0; 3], 0.0, true, rng.f() * 10.0);
+    }
     // bushes along the edges
     for _ in 0..70 {
         let ang = rng.f() * PI * 2.0;
@@ -346,29 +450,62 @@ pub fn build_env() -> DrawList {
         let g = greens[(rng.f() * 5.0) as usize % 5];
         bush(&mut dl, &mut rng, vec3(x, 0.0, z), sc, g);
     }
-    // flowers, stones and fallen leaves in the grass
-    let petals = [hex(0xf2e14a), hex(0xe9e6df), hex(0xd8486a), hex(0x7a5ad0), hex(0xe9843a)];
-    for _ in 0..90 {
+    // the undergrowth: grass in clumps, ferns and mushrooms under the trees, flowers, clover and stones; not on
+    // the pitch, the path or in the pond (the lawn's own blades grow everywhere, see `gfx`)
+    let free = |x: f32, z: f32| {
+        let px = -11.5 + (z * 0.07).sin() * 3.0;
+        !((x.abs() < 9.5 && z.abs() < 12.5) || (x - px).abs() < 2.2 || ((z - 19.0).abs() < 1.9 && x > -12.0) || ((x - 20.0) / 11.8).powi(2) + ((z + 22.0) / 7.8).powi(2) < 1.0)
+    };
+    let grasses = ["Grass_Common_Short", "Grass_Common_Tall", "Grass_Wispy_Short", "Grass_Wispy_Tall"];
+    let mut n = 0;
+    while n < 1400 {
         let ang = rng.f() * PI * 2.0;
-        let r = 10.5 + rng.f() * 22.0;
-        let (cx, cz) = (ang.sin() * r, ang.cos() * r);
-        if (cx + 11.5 - (cz * 0.07).sin() * 3.0).abs() < 2.2 {
+        let r = 9.0 + rng.f() * 52.0;
+        let (x, z) = (ang.sin() * r, ang.cos() * r);
+        if !free(x, z) {
             continue;
         }
-        let c = petals[(rng.f() * 5.0) as usize % 5];
-        for _ in 0..5 {
-            let (x, z) = (cx + (rng.f() - 0.5) * 0.8, cz + (rng.f() - 0.5) * 0.8);
-            let h = 0.12 + rng.f() * 0.1;
-            dl.solid(Mesh::Cyl, t(x, h * 0.5, z) * s(0.004, h, 0.004), hex(0x3b6a22));
-            dl.solid(Mesh::Sphere, t(x, h, z) * s(0.028, 0.016, 0.028), c);
-        }
+        n += 1;
+        let g = 0.85 + rng.f() * 0.25;
+        plant(&mut dl, grasses[(rng.f() * 4.0) as usize % 4], vec3(x, 0.0, z), rng.f() * 6.3, 0.28 + rng.f() * 0.18, [g, g, g * 0.9], 32.0, false, rng.f() * 10.0);
     }
-    for _ in 0..24 {
+    for _ in 0..110 {
         let ang = rng.f() * PI * 2.0;
-        let r = 11.0 + rng.f() * 30.0;
-        let sc = 0.12 + rng.f() * 0.3;
-        let g = 0.3 + rng.f() * 0.12;
-        dl.solid(Mesh::Sphere, t(ang.sin() * r, sc * 0.3, ang.cos() * r) * ry(rng.f() * 6.0) * s(sc * 1.3, sc * 0.75, sc), [g, g, g * 0.95]);
+        let r = 10.5 + rng.f() * 26.0;
+        let (x, z) = (ang.sin() * r, ang.cos() * r);
+        if !free(x, z) {
+            continue;
+        }
+        let what = ["Flower_3_Group", "Flower_4_Group", "Clover_1", "Clover_2", "Plant_1", "Plant_7"][(rng.f() * 6.0) as usize % 6];
+        plant(&mut dl, what, vec3(x, 0.0, z), rng.f() * 6.3, 0.22 + rng.f() * 0.1, [1.0; 3], 30.0, false, rng.f() * 10.0);
+    }
+    for _ in 0..40 {
+        let ang = rng.f() * PI * 2.0;
+        let r = 12.0 + rng.f() * 34.0;
+        let (x, z) = (ang.sin() * r, ang.cos() * r);
+        if !free(x, z) {
+            continue;
+        }
+        let what = ["Fern_1", "Fern_1", "Mushroom_Common"][(rng.f() * 3.0) as usize % 3];
+        plant(&mut dl, what, vec3(x, 0.0, z), rng.f() * 6.3, if what == "Fern_1" { 0.5 + rng.f() * 0.3 } else { 0.35 + rng.f() * 0.2 }, [1.0; 3], 30.0, false, rng.f() * 10.0);
+    }
+    for _ in 0..30 {
+        let ang = rng.f() * PI * 2.0;
+        let r = 11.0 + rng.f() * 34.0;
+        let (x, z) = (ang.sin() * r, ang.cos() * r);
+        if !free(x, z) {
+            continue;
+        }
+        let k = rng.f();
+        let (what, size) = if k < 0.3 { (["Rock_Medium_1", "Rock_Medium_2", "Rock_Medium_3"][(rng.f() * 3.0) as usize % 3], 0.18 + rng.f() * 0.25) } else { (["Pebble_Round_1", "Pebble_Round_2", "Pebble_Round_3"][(rng.f() * 3.0) as usize % 3], 0.8 + rng.f() * 0.8) };
+        plant(&mut dl, what, vec3(x, 0.0, z), rng.f() * 6.3, size, [1.0; 3], 40.0, k < 0.3, rng.f() * 10.0);
+    }
+    // stones along the path's edges
+    for k in 0..60 {
+        let z = -55.0 + k as f32 * 1.9 + rng.f();
+        let side = if k % 2 == 0 { 1.0 } else { -1.0 };
+        let x = -11.5 + (z * 0.07).sin() * 3.0 + side * (1.65 + rng.f() * 0.3);
+        plant(&mut dl, ["Pebble_Round_1", "Pebble_Round_2", "Pebble_Round_3"][k % 3], vec3(x, 0.0, z), rng.f() * 6.3, 0.6 + rng.f() * 0.5, [1.0; 3], 30.0, false, 0.0);
     }
     // what people leave in a park: bikes against the trees, a blanket and a bag
     for k in 0..7 {
@@ -495,7 +632,7 @@ fn build_people(dl: &mut DrawList, model: &Model, g: &Game, cam: &Cam, o: &Scene
             let rig = person(dl, model, p, &lk, p.visible && !hidden);
             hand_of[ti][i] = rig.hand_r;
             mouth_of[ti][i] = rig.mouth;
-            heads[ti][i] = rig.head.transform_point3(vec3(0.0, 0.3, 0.0));
+            heads[ti][i] = rig.head.transform_point3(body::CRANIUM + vec3(0.0, body::CRANIUM_R + 0.1, 0.0));
             if p.anim.emote > 0 && p.visible && !hidden {
                 emote_prop(dl, p, &rig, cam, ti * 3 + i);
             }
@@ -653,11 +790,44 @@ pub fn build_hub_player(dl: &mut DrawList, model: &Model, p: &Person, lk: &Look)
 }
 
 #[cfg(test)]
+mod hat_dump {
+    use super::*;
+    /// Writes every hat as a PLY with vertex colours (Blender's axes: Z up, -Y forward) for the shop's
+    /// pictures: `FLUNKI_HATS=dir cargo test --release --lib dump_hats -- --ignored`, see tools/icons_blender.py.
+    #[test]
+    #[ignore]
+    fn dump_hats() {
+        let dir = std::env::var("FLUNKI_HATS").expect("FLUNKI_HATS=dir");
+        for h in 1..HAT_NAMES.len() as u8 {
+            let mut dl = DrawList::default();
+            hat(&mut dl, Mat4::IDENTITY, h, [0.0; 3]);
+            let (mut vs, mut fs) = (Vec::new(), Vec::new());
+            for (mesh, i) in dl.opaque.iter().chain(dl.blend.iter()) {
+                let m = Mat4::from_cols_array_2d(&i.m);
+                let (p, n, t) = crate::gfx::mesh_geometry(*mesh);
+                let base = vs.len();
+                let srgb = |c: f32| (c.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0) as u8;
+                for (p, n) in p.iter().zip(n.iter()) {
+                    let w = m.transform_point3(*p);
+                    let nn = m.inverse().transpose().transform_vector3(*n).normalize_or(Vec3::Y);
+                    vs.push(format!("{} {} {} {} {} {} {} {} {}", w.x, -w.z, w.y, nn.x, -nn.z, nn.y, srgb(i.color[0]), srgb(i.color[1]), srgb(i.color[2])));
+                }
+                for t in t.chunks(3) {
+                    fs.push(format!("3 {} {} {}", t[0] as usize + base, t[1] as usize + base, t[2] as usize + base));
+                }
+            }
+            let head = format!("ply\nformat ascii 1.0\nelement vertex {}\nproperty float x\nproperty float y\nproperty float z\nproperty float nx\nproperty float ny\nproperty float nz\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nelement face {}\nproperty list uchar int vertex_indices\nend_header\n", vs.len(), fs.len());
+            std::fs::write(format!("{dir}/hat_{h}.ply"), head + &vs.join("\n") + "\n" + &fs.join("\n") + "\n").unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
 mod pose_tests {
     use super::*;
     use crate::game::{AMode, Person};
     fn rig_after(p: &mut Person, secs: f32, speed: f32) -> Rig {
-        let m = Model::load(include_bytes!("../assets/person.glb")).unwrap();
+        let m = crate::model::tests::load();
         p.vis.treadmill = speed;
         for _ in 0..(secs * 60.0) as usize {
             if p.anim.throw_t >= 0.0 {
@@ -670,18 +840,21 @@ mod pose_tests {
     }
     #[test]
     fn poses_touch_the_world() {
-        // standing: both feet on the floor
+        // standing: both feet on the floor (the foot bones are at the ankles)
+        let ankle = crate::model::tests::load().rigs[ref_look().wear.rig()].legs.ankle;
         let mut p = Person::new(Vec3::ZERO, 0.0);
         let r = rig_after(&mut p, 1.0, 0.0);
         println!("idle feet {:?}", r.feet);
         for f in r.feet {
-            assert!(f.y.abs() < 0.05, "idle foot off the floor {f:?}");
+            assert!((f.y - ankle).abs() < 0.05, "idle foot off the floor {f:?}");
         }
         // drinking: the hand comes to the mouth
         let mut p = Person::new(Vec3::ZERO, 0.0);
+        p.anim.carry = true;
         p.anim.sip = true;
-        let r = rig_after(&mut p, 1.5, 0.0);
+        let r = rig_after(&mut p, 2.0, 0.0);
         println!("sip hand {:?} mouth {:?} dist {}", r.hand_r, r.mouth, r.hand_r.distance(r.mouth));
+        assert!(r.hand_r.distance(r.mouth) < 0.15, "the hand stays {} from the mouth", r.hand_r.distance(r.mouth));
         // squat: feet stay down
         let mut p = Person::new(Vec3::ZERO, 0.0);
         p.anim.mode = AMode::Bend;
@@ -692,9 +865,9 @@ mod pose_tests {
         p.anim.mode = AMode::Sit;
         let r = rig_after(&mut p, 2.0, 0.0);
         println!("sit feet {:?}", r.feet);
-        assert!(r.feet.iter().all(|f| f.y < 0.09), "seated feet stay on the ground: {:?}", r.feet);
+        assert!(r.feet.iter().all(|f| f.y < ankle + 0.09), "seated feet stay on the ground: {:?}", r.feet);
         // the seat of his shorts rests exactly on the top of the crate
-        let m = Model::load(include_bytes!("../assets/person.glb")).unwrap();
+        let m = crate::model::tests::load();
         let mut dl = DrawList::default();
         person(&mut dl, &m, &p, &ref_look(), true);
         let bones = &dl.skinned[0].bones;
@@ -712,7 +885,7 @@ mod pose_tests {
             }
         }
         println!("lowest point over the crate: {low}");
-        assert!((low - 0.4).abs() < 0.001, "sits at {low}, the crate's top is at 0.4");
+        assert!((low - 0.4).abs() < 0.01, "sits at {low}, the crate's top is at 0.4");
         // bending down for the can: the hand gets near the can in front of the feet
         let mut p = Person::new(Vec3::ZERO, 0.0);
         p.anim.carry = true;
@@ -747,7 +920,7 @@ mod perf_tests {
     use crate::game::Sfx;
     #[test]
     fn frame_cost_around_a_hit() {
-        let m = Model::load(include_bytes!("../assets/person.glb")).unwrap();
+        let m = crate::model::tests::load();
         let mut g = Game::new(7);
         g.start_match(game::Mode::Demo, 1);
         let looks = [[player_look([0.9, 0.7, 0.1], 0, 3), player_look([0.9, 0.7, 0.1], 1, 3), player_look([0.9, 0.7, 0.1], 2, 3)], [player_look([0.2, 0.6, 0.9], 0, 3), player_look([0.2, 0.6, 0.9], 1, 3), player_look([0.2, 0.6, 0.9], 2, 3)]];

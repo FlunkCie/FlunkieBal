@@ -9,8 +9,8 @@ use glam::{vec3, Vec3};
 use std::f32::consts::{PI, TAU};
 
 pub const STAND_HIP: f32 = 0.794; // standing hip height of the model, metres
-const ANKLE: f32 = 0.02;
-const HIP_X: f32 = 0.119;
+pub const ANKLE: f32 = 0.02;
+pub const HIP_X: f32 = 0.119;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Pose {
@@ -92,7 +92,7 @@ pub struct Vis {
     accel: f32,
     gait: f32,
     w_bend: f32,
-    w_sit: f32,
+    pub w_sit: f32,
     w_cheer: f32,
     w_hold: f32,
     w_point: f32,

@@ -199,17 +199,21 @@ impl Hub {
     }
     fn tick_rooms(&mut self, dt: f32) {
         let mut dead = Vec::new();
+        let mut said = Vec::new();
         for (code, r) in self.rooms.iter_mut() {
             if !r.tick(dt) {
                 dead.push(code.clone());
             }
             if let Some(f) = r.finished.take() {
-                self.social.record(&f);
+                said.extend(self.social.record(&f));
             }
         }
         for code in dead {
             if let Some(r) = self.rooms.remove(&code) {
                 info!("room={code} closed: nobody left ({})", r.summary());
+                // a match with bets nobody finished: called off
+                let bets: Vec<(String, u32)> = r.bets.iter().map(|b| (b.0.clone(), b.3)).collect();
+                said.extend(self.social.refund(&bets));
                 for c in self.clients.values_mut() {
                     if c.seat.as_ref().map_or(false, |s| s.0 == code) {
                         c.seat = None;
@@ -217,6 +221,7 @@ impl Hub {
                 }
             }
         }
+        self.deliver(said);
     }
     fn event(&mut self, e: Event) {
         match e {
@@ -409,18 +414,16 @@ impl Hub {
                 if !self.version_ok(conn, v) {
                     return;
                 }
-                if only && !self.social.known(&code, &secret) {
-                    info!("friends: conn={conn} came back as {code}, which isn't an account (any more)");
+                // only a kept session: a new account takes a username and password (`Register`)
+                let _ = only;
+                if !self.social.known(&code, &secret) {
+                    info!("friends: conn={conn} came back as {code:?}, which isn't an account (any more)");
                     self.tell(conn, &FromServer::AuthErr { msg: "You've been logged out, log in again".into() });
                     return;
                 }
-                match self.social.hello(conn, &code, &secret, &clean(&name)) {
-                    Ok(m) => {
-                        self.deliver(m);
-                        self.logged_in(conn);
-                    }
-                    Err(msg) => self.tell(conn, &FromServer::SocialErr { msg }),
-                }
+                let m = self.social.attach(conn, &code, &clean(&name));
+                self.deliver(m);
+                self.logged_in(conn);
             }
             ToServer::Register { v, user, pass, .. } => {
                 if !self.version_ok(conn, v) {
@@ -467,7 +470,7 @@ impl Hub {
                     let _ = me.send(Event::Checked { conn, user, code, name, ok });
                 });
             }
-            ToServer::SName { .. } | ToServer::SProgress { .. } | ToServer::SStatus { .. } | ToServer::FriendAdd { .. } | ToServer::FriendRemove { .. } | ToServer::Say { .. } | ToServer::ChatOpen { .. } | ToServer::FriendStats { .. } | ToServer::Invite { .. } => {
+            ToServer::SName { .. } | ToServer::SProgress { .. } | ToServer::SStatus { .. } | ToServer::FriendAdd { .. } | ToServer::FriendRemove { .. } | ToServer::Say { .. } | ToServer::ChatOpen { .. } | ToServer::FriendStats { .. } | ToServer::Invite { .. } | ToServer::Board { .. } | ToServer::Buy { .. } => {
                 let can_invite = if let ToServer::Invite { room, .. } = &m { self.room_open(room) } else { true };
                 match self.social.handle(conn, m, can_invite) {
                     Ok(out) => self.deliver(out),
@@ -479,7 +482,7 @@ impl Hub {
                 let rooms = self.rooms.iter().filter(|(_, r)| r.open && r.phase != PHASE_PLAYING && r.seats.len() < MAX_PEOPLE).map(|(c, r)| RoomInfo { code: c.clone(), name: r.host_name(), n: r.seats.len() }).take(20).collect();
                 self.tell(conn, &FromServer::Rooms { rooms });
             }
-            ToServer::Host { v, name, look, me } => {
+            ToServer::Host { v, name, look, me, wear } => {
                 if !self.version_ok(conn, v) {
                     return;
                 }
@@ -488,6 +491,10 @@ impl Hub {
                     self.tell(conn, &FromServer::Err { msg: "The server is full. Try again in a bit.".into(), fatal: false });
                     return;
                 }
+                let Some(account) = self.social.verified(&me) else {
+                    self.tell(conn, &FromServer::Err { msg: "Log in to play online".into(), fatal: false });
+                    return;
+                };
                 self.leave_current(conn);
                 let code = self.new_code();
                 self.next_seat += 1;
@@ -501,12 +508,12 @@ impl Hub {
                 let cn = c.conn.clone();
                 let addr = c.addr;
                 let _ = cn.tx.send(out(&FromServer::Welcome { code: code.clone(), id, token: token.clone(), resumed: false }));
-                r.add_seat(id, name.clone(), look, token, cn);
-                r.set_account(id, self.social.verified(&me));
+                r.add_seat(id, name.clone(), look, wear, token, cn);
+                r.set_account(id, Some(account));
                 info!("room={code} created by player={id} ({name}) from {addr}");
                 self.rooms.insert(code, r);
             }
-            ToServer::Join { v, code, name, look, me } => {
+            ToServer::Join { v, code, name, look, me, wear } => {
                 if !self.version_ok(conn, v) {
                     return;
                 }
@@ -515,6 +522,7 @@ impl Hub {
                     None => Some(format!("No match with code {code}")),
                     Some(r) if r.seats.len() >= MAX_PEOPLE => Some("That match is full".to_string()),
                     Some(r) if r.phase == PHASE_PLAYING => Some("That match has already started".to_string()),
+                    _ if self.social.verified(&me).is_none() => Some("Log in to play online".to_string()),
                     _ => None,
                 };
                 if let Some(msg) = why {
@@ -534,7 +542,7 @@ impl Hub {
                 let _ = cn.tx.send(out(&FromServer::Welcome { code: code.clone(), id, token: token.clone(), resumed: false }));
                 let account = self.social.verified(&me);
                 let Some(r) = self.rooms.get_mut(&code) else { return };
-                r.add_seat(id, name.clone(), look, token, cn);
+                r.add_seat(id, name.clone(), look, wear, token, cn);
                 r.set_account(id, account);
                 info!("room={code} player={id} ({name}) joined from {addr} ({} people)", r.seats.len());
             }
@@ -562,12 +570,38 @@ impl Hub {
                 match other {
                     ToServer::Leave => self.leave_current(conn),
                     ToServer::Start => {
-                        if let Some(r) = self.rooms.get_mut(&code) {
-                            let was = r.phase;
-                            r.start(id);
-                            if r.phase == PHASE_PLAYING && was != PHASE_PLAYING {
-                                self.played += 1;
+                        let Some(r) = self.rooms.get_mut(&code) else { return };
+                        let stake = r.stake;
+                        // with a bet, everyone must be able to pay it
+                        let bettors = if stake > 0 && id == r.host && r.phase != PHASE_PLAYING {
+                            let ok = r.bettors().and_then(|b| match b.iter().find(|x| self.social.coins(&x.0) < stake) {
+                                Some(x) => Err(format!("{} hasn't got {stake} coins", x.3)),
+                                None => Ok(b),
+                            });
+                            match ok {
+                                Ok(b) => b,
+                                Err(why) => {
+                                    debug!("room={code} can't start its bet: {why}");
+                                    r.notice("Can't start the bet", why);
+                                    return;
+                                }
                             }
+                        } else {
+                            Vec::new()
+                        };
+                        let was = r.phase;
+                        r.start(id);
+                        if r.phase == PHASE_PLAYING && was != PHASE_PLAYING {
+                            self.played += 1;
+                            let mut said = Vec::new();
+                            for (acc, seat, team, _) in bettors {
+                                said.extend(self.social.stake(&acc, stake));
+                                r.bets.push((acc, seat, team, stake));
+                            }
+                            if !r.bets.is_empty() {
+                                info!("room={code} bets {stake} coins each, pot {}", stake * r.bets.len() as u32);
+                            }
+                            self.deliver(said);
                         }
                     }
                     _ => {
@@ -579,7 +613,7 @@ impl Hub {
                                     r.roster();
                                 }
                             }
-                            ToServer::Config { arena, diff } => r.config(id, arena, diff),
+                            ToServer::Config { arena, diff, stake } => r.config(id, arena, diff, stake),
                             ToServer::Team { team } => r.set_team(id, team),
                             ToServer::Input { n, i } => r.input(id, n, i),
                             ToServer::Qm { i } => r.qm(id, i),

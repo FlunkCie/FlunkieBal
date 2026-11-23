@@ -45,6 +45,10 @@ pub(crate) enum Sheet {
     Account,
     /// tell us what went wrong
     Bug,
+    /// hats for coins
+    Shop,
+    /// the top players
+    Board,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PlayStep {
@@ -146,6 +150,16 @@ pub struct FlunkiApp {
     pub(crate) time: f64,
     pub(crate) frame_list: DrawList,
     pub(crate) cam_override: Option<(Vec3, Vec3)>,
+    /// who the game's own players are this match (`scene::random_look`)
+    pub(crate) look_seed: u64,
+    /// something from the shop on your player, to see how it looks before buying it
+    pub(crate) try_on: Option<u8>,
+    /// the shop: which tab, whose clothes, the card that's open, trying it on, the pictures
+    pub(crate) shop_tab: usize,
+    pub(crate) shop_body: u8,
+    pub(crate) shop_pick: Option<u8>,
+    pub(crate) shop_trying: bool,
+    pub(crate) shop_tex: Vec<egui::TextureHandle>,
     pub(crate) hub_person: Person,
     pub(crate) hub_cheer: f32,
     pub(crate) last_xp: Option<XpResult>,
@@ -169,6 +183,9 @@ pub struct FlunkiApp {
     /// the connection is kept open all the time: when to try again after it went, and how often it has
     net_retry: (f64, u32),
     pub(crate) code_in: String,
+    /// the bet the host picks for an online match (coins each), and the leaderboard on show
+    pub(crate) stake: u32,
+    pub(crate) board: u8,
     pub(crate) name_edit: String,
     pub(crate) screen_rect: Rect,
     /// safe area (top, right, bottom, left) kept clear of the notch and the home bar
@@ -215,13 +232,14 @@ pub struct FlunkiApp {
 impl FlunkiApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let t0 = now_ms();
-        let model = Arc::new(Model::load(include_bytes!("../assets/person.glb")).expect("person model"));
+        let model = Arc::new(Model::load(&[include_bytes!("../assets/people_m.glb"), include_bytes!("../assets/people_f.glb")], include_bytes!("../assets/people.png")).expect("person model"));
         if let Some(rs) = cc.wgpu_render_state.as_ref() {
             // a GPU validation error (browsers differ in what they accept) costs a frame, not the game
             rs.device.on_uncaptured_error(std::sync::Arc::new(|e: egui_wgpu::wgpu::Error| {
                 log_str(&format!("gpu error: {e}"));
             }));
-            let gfx = Gfx::new(rs, &model);
+            let nature = crate::nature::Nature::load(include_bytes!("../assets/nature.glb"), include_bytes!("../assets/nature.png")).expect("nature models");
+            let gfx = Gfx::new(rs, &model, &nature);
             rs.renderer.write().callback_resources.insert(gfx);
         }
         log_str(&format!("startup: model and renderer {:.0} ms", now_ms() - t0));
@@ -269,6 +287,13 @@ impl FlunkiApp {
             time: 0.0,
             frame_list: DrawList::default(),
             cam_override: None,
+            look_seed: 1,
+            try_on: None,
+            shop_tab: 0,
+            shop_body: 0,
+            shop_pick: None,
+            shop_trying: false,
+            shop_tex: Vec::new(),
             hub_person: Person::new(arenas::HUB_O, 0.25),
             hub_cheer: 0.0,
             last_xp: None,
@@ -291,6 +316,8 @@ impl FlunkiApp {
             net_err: String::new(),
             net_retry: (0.0, 0),
             code_in: String::new(),
+            stake: 0,
+            board: net::BOARD_RATING,
             screen_rect: Rect::from_min_size(Pos2::ZERO, vec2(400.0, 800.0)),
             safe: [0.0; 4],
             safe_t: -1.0,
@@ -345,6 +372,7 @@ impl FlunkiApp {
         self.match_arena = self.arena;
         self.game.bounds = self.match_arena.bounds();
         self.game.start_match(mode, self.save.diff);
+        self.look_seed = now_ms().to_bits();
         self.after_start();
         self.stats_begin();
     }
@@ -423,25 +451,52 @@ impl FlunkiApp {
     // ---------- looks ----------
     pub(crate) fn my_look(&self) -> [u8; 7] {
         let p = &self.save.profile;
-        [p.color as u8, p.skin as u8, p.hair as u8, p.shorts as u8, p.voice as u8, p.hat, self.save.level().min(255) as u8]
+        // a bought hat only while it's yours (logged out, it isn't)
+        let hat = if self.save.unlocked(save::Unlock::Hat(p.hat)) { p.hat } else { 0 };
+        [p.color as u8, p.skin as u8, p.hair as u8, p.shorts as u8, p.voice as u8, hat, self.save.level().min(255) as u8]
     }
-    pub(crate) fn look_of(l: &[u8; 7], i: usize) -> Look {
+    /// The shop, at your own body's clothes.
+    pub(crate) fn open_shop(&mut self) {
+        self.sheet = Sheet::Shop;
+        self.shop_body = crate::body::Wear::from_bytes(self.save.profile.wear).body;
+        self.shop_pick = None;
+        self.shop_trying = false;
+    }
+    /// What you have on: only what's yours (a piece you no longer have is swapped for an everyday one).
+    pub(crate) fn my_wear(&self) -> [u8; 8] {
+        let mut w = crate::body::Wear::from_bytes(self.save.profile.wear);
+        for s in w.slots.iter_mut() {
+            if !self.save.has_item(*s) {
+                *s = 0;
+            }
+        }
+        w.to_bytes()
+    }
+    pub(crate) fn look_of(l: &[u8; 7], wear: &[u8; 8], i: usize) -> Look {
         let shirt = hex(save::SWATCHES[l[0] as usize % 8]);
         let mut lk = scene::player_look(shirt, i, i);
         lk.skin = hex(save::SKIN_OPTS[l[1] as usize % 6]);
         lk.hair = hex(save::HAIR_OPTS[l[2] as usize % 6]);
         lk.shorts = hex(save::SHORTS_OPTS[l[3] as usize % 6]);
-        lk.hat = l[5].min(5);
+        lk.hat = l[5].min(scene::HAT_NAMES.len() as u8 - 1);
+        lk.wear = crate::body::Wear::from_bytes(*wear);
         lk
     }
     fn looks(&self) -> [[Look; 3]; 2] {
         let g = &self.game;
         let blue = hex(0x2f86b8);
         let gold = hex(0xe8b02a);
+        // everyone the game puts on the pitch is someone new each match (online: the same on every screen in
+        // the room); only real players look like themselves
+        let seed = match (g.mode, self.net.as_ref()) {
+            (Mode::Online, Some(n)) => n.code.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3)),
+            _ => self.look_seed,
+        };
+        let anyone = |col: [f32; 3], k: usize| scene::random_look(col, seed.wrapping_add(k as u64 * 0x9e3779b97f4a7c15));
         let mut out = [[scene::player_look(gold, 0, 0); 3]; 2];
         for t in 0..2 {
             for i in 0..3 {
-                out[t][i] = scene::player_look(if t == 0 { gold } else { blue }, i, t * 3 + i);
+                out[t][i] = anyone(if t == 0 { gold } else { blue }, t * 3 + i);
             }
         }
         match g.mode {
@@ -449,14 +504,14 @@ impl FlunkiApp {
                 let me = self.my_look();
                 let col = self.save.profile.color;
                 for i in 0..3 {
-                    out[0][i] = scene::player_look(hex(save::SWATCHES[col]), i, i);
+                    out[0][i] = anyone(hex(save::SWATCHES[col]), i);
                 }
                 if col == 5 {
                     for i in 0..3 {
-                        out[1][i] = scene::player_look(gold, i, 3 + i); // the computer switches to gold if you wear blue
+                        out[1][i] = anyone(gold, 3 + i); // the computer switches to gold if you wear blue
                     }
                 }
-                out[0][0] = Self::look_of(&me, 0);
+                out[0][0] = Self::look_of(&me, &self.my_wear(), 0);
             }
             Mode::Online => {
                 if let Some(n) = self.net.as_ref() {
@@ -471,10 +526,10 @@ impl FlunkiApp {
                         let hs = n.humans(t as u8);
                         let col = hex(save::SWATCHES[if t == 0 { c0 } else { c1 }]);
                         for i in 0..3 {
-                            let mut lk = scene::player_look(col, i, t * 3 + i);
+                            let mut lk = anyone(col, t * 3 + i);
                             if let Some(o) = n.owner(t, i) {
                                 if i < hs.len() {
-                                    lk = Self::look_of(&o.look, i);
+                                    lk = Self::look_of(&o.look, &o.wear, i);
                                     lk.shirt = scene::player_look(col, i, 0).shirt;
                                 }
                             }
@@ -1218,7 +1273,7 @@ impl FlunkiApp {
 
     // ---------- online ----------
     pub(crate) fn net_connect(&mut self) -> bool {
-        if self.save.locked() {
+        if !self.save.online() {
             self.net_err = "Log in to play online".into();
             return false;
         }
@@ -1240,7 +1295,7 @@ impl FlunkiApp {
     /// The connection to the server is always there (once you may play online), so hosting, joining and
     /// finding a match don't wait for one. When it goes it comes back by itself, sooner at first.
     fn net_keep(&mut self) {
-        if self.save.locked() {
+        if !self.save.online() {
             if let Some(n) = self.net.take() {
                 n.sock.close();
             }
@@ -1271,14 +1326,16 @@ impl FlunkiApp {
             return;
         }
         let (name, look, me) = (self.save.profile.name.clone(), self.my_look(), self.account_here());
-        self.net.as_mut().unwrap().send(ToServer::Host { v: net::PROTOCOL, name, look, me });
+        let wear = self.my_wear();
+        self.net.as_mut().unwrap().send(ToServer::Host { v: net::PROTOCOL, name, look, me, wear });
     }
     pub(crate) fn net_join(&mut self, code: &str) {
         if !self.net_connect() {
             return;
         }
         let (name, look, me) = (self.save.profile.name.clone(), self.my_look(), self.account_here());
-        self.net.as_mut().unwrap().send(ToServer::Join { v: net::PROTOCOL, code: code.to_string(), name, look, me });
+        let wear = self.my_wear();
+        self.net.as_mut().unwrap().send(ToServer::Join { v: net::PROTOCOL, code: code.to_string(), name, look, me, wear });
     }
     pub(crate) fn net_list(&mut self) {
         if !self.net_connect() {
@@ -1351,8 +1408,14 @@ impl FlunkiApp {
             _ => net::STATUS_FREE,
         };
         let url = save::server();
-        // with a password, never a new account by just connecting: a session that's gone is logged out
-        let only = save::needs_login() || self.save.logged_in();
+        // never a new account by just connecting: logged out, the connection waits for a login; a
+        // session that's gone is logged out
+        let only = true;
+        if !self.save.logged_in() && !self.save.account.1.is_empty() {
+            // a phone's own account from before logging in was needed: gone from the server
+            self.save.account = Default::default();
+            self.save.store();
+        }
         if only && !self.save.user.is_empty() && self.save.account.0 != url {
             // logged in on another server: not here
             self.save.log_out();
@@ -1381,6 +1444,18 @@ impl FlunkiApp {
                     self.login_pass.clear();
                 }
                 Got::Progress { rev, data } => self.take_progress(rev, data),
+                Got::Wallet { coins, owned, gain, why } => {
+                    if (coins, &owned) != (self.save.coins, &self.save.owned) {
+                        self.save.coins = coins;
+                        self.save.owned = owned;
+                        self.save.store();
+                    }
+                    if gain != 0 {
+                        let title = if gain > 0 { format!("+{gain} coins") } else { format!("{gain} coins") };
+                        self.banner = Some((game::Banner { title, sub: why, dur: 2.2, straf: false }, 0.0));
+                        crate::audio::ui(if gain > 0 { Cue::Chime } else { Cue::Pop });
+                    }
+                }
                 Got::LoggedOut => {
                     self.save.log_out();
                     self.name_edit = self.save.profile.name.clone();
@@ -1479,7 +1554,7 @@ impl FlunkiApp {
     /// Notifications: who the phone checks for in the background, what came in, and what was tapped.
     fn notes_poll(&mut self) {
         let notes = std::mem::take(&mut self.social.notes);
-        let on = self.save.settings.notify && !self.save.locked();
+        let on = self.save.settings.notify && self.save.online();
         #[cfg(target_os = "android")]
         {
             let url = save::server();
@@ -1642,11 +1717,12 @@ impl FlunkiApp {
         }
         // the host's choices in the lobby
         if n.host() && n.phase != net::PHASE_PLAYING {
-            let (arena, diff) = (self.arena.id(), self.save.diff as u8);
-            if n.arena != arena || n.diff != diff {
+            let (arena, diff, stake) = (self.arena.id(), self.save.diff as u8, self.stake);
+            if n.arena != arena || n.diff != diff || n.stake != stake {
                 n.arena = arena.into();
                 n.diff = diff;
-                n.send(ToServer::Config { arena: arena.into(), diff });
+                n.stake = stake;
+                n.send(ToServer::Config { arena: arena.into(), diff, stake });
             }
         }
     }
@@ -1695,8 +1771,9 @@ impl FlunkiApp {
                     self.banner = Some((game::Banner { title: "Back in".into(), sub: "Connection restored".into(), dur: 1.4, straf: false }, 0.0));
                 }
             }
-            FromServer::Roster { members, host, arena, diff, phase, open } => {
+            FromServer::Roster { members, host, arena, diff, phase, open, stake } => {
                 n.members = members;
+                n.stake = stake;
                 n.host_id = host;
                 n.arena = arena;
                 n.diff = diff;
@@ -2086,7 +2163,11 @@ impl eframe::App for FlunkiApp {
             arenas::chalk_records(&mut list, &self.save.train_pb);
         }
         if shown == ArenaKey::Hub {
-            let lk = Self::look_of(&self.my_look(), 0);
+            let mut lk = Self::look_of(&self.my_look(), &self.my_wear(), 0);
+            // in the shop: what you're looking at, on you
+            if let Some(id) = self.try_on {
+                lk.wear = crate::ui::shop::tried_on(lk.wear, &mut lk.hat, id);
+            }
             scene::build_hub_player(&mut list, &self.model, &self.hub_person, &lk);
         } else {
             let opts = SceneOpts {
@@ -2283,6 +2364,16 @@ impl FlunkiApp {
                 "back" => {
                     self.back();
                 }
+                // the shop: a tab, a card opened, something tried on
+                "shoptab" => {
+                    self.open_shop();
+                    self.shop_tab = arg.parse().unwrap_or(0);
+                }
+                "shoppick" => self.shop_pick = arg.parse().ok(),
+                "tryon" => {
+                    self.try_on = arg.parse().ok();
+                    self.shop_trying = self.try_on.is_some();
+                }
                 "sheet" => {
                     self.sheet = match arg {
                         "profile" => Sheet::Profile,
@@ -2294,6 +2385,8 @@ impl FlunkiApp {
                         "friends" => Sheet::Friends,
                         "account" => Sheet::Account,
                         "bug" => Sheet::Bug,
+                        "shop" => Sheet::Shop,
+                        "board" => Sheet::Board,
                         _ => Sheet::None,
                     }
                 }
@@ -2307,6 +2400,19 @@ impl FlunkiApp {
                     };
                 }
                 "arena" => self.arena = ArenaKey::from_id(arg),
+                // coins: a leaderboard (`board:0`…), buying a hat (`buy:6`), the host's bet (`stake:50`)
+                "board" => {
+                    self.board = arg.parse().unwrap_or(net::BOARD_RATING);
+                    self.social.ask_board(self.board);
+                    self.sheet = Sheet::Board;
+                }
+                "buy" => {
+                    if let Ok(h) = arg.parse() {
+                        self.social.buy(h);
+                    }
+                }
+                "stake" => self.stake = arg.parse().unwrap_or(0),
+                "hat" => self.save.profile.hat = arg.parse().unwrap_or(0),
                 "xp" => {
                     if let Ok(v) = arg.parse() {
                         self.save.xp = v;
@@ -2455,8 +2561,8 @@ impl FlunkiApp {
                 "state" => {
                     let n = self.net.as_ref().map(|n| format!("net(id={} host={} room={} members={:?} phase={} rtt={:.3} link={:?} pause={:?} skipped={} missed={} err={})", n.id, n.host(), n.code, n.members.iter().map(|m| (m.name.clone(), m.team, m.away)).collect::<Vec<_>>(), n.phase, n.rtt, n.link(self.game.pred.snap_age, self.game.mirror), self.game.net_pause, self.game.pred.skipped_snaps, self.game.pred.missed_ev, self.net_err)).unwrap_or_else(|| format!("nonet err={}", self.net_err));
                     log_str(&format!(
-                        "screen={:?} view={:?} sheet={:?} state={:?} mode={:?} mirror={} turn={} beers={:?}/{:?} straf={}/{} xp={} lv={} matches={} pb={:?} tut={:?} my_team={:?} {}",
-                        self.screen, self.view, self.sheet, self.game.state, self.game.mode, self.game.mirror, self.game.turn, self.game.teams[0].beers, self.game.teams[1].beers, self.game.teams[0].straf, self.game.teams[1].straf, self.save.xp, self.save.level(), self.save.matches.len(), self.save.train_pb, self.game.tut, self.game.my_team, n
+                        "screen={:?} view={:?} sheet={:?} state={:?} mode={:?} mirror={} turn={} beers={:?}/{:?} straf={}/{} xp={} lv={} matches={} pb={:?} tut={:?} my_team={:?} coins={} owned={:?} boards={:?} {}",
+                        self.screen, self.view, self.sheet, self.game.state, self.game.mode, self.game.mirror, self.game.turn, self.game.teams[0].beers, self.game.teams[1].beers, self.game.teams[0].straf, self.game.teams[1].straf, self.save.xp, self.save.level(), self.save.matches.len(), self.save.train_pb, self.game.tut, self.game.my_team, self.save.coins, self.save.owned, self.social.boards.iter().map(|(k, v)| (*k, v.0.len(), v.1.as_ref().map(|r| r.rank))).collect::<Vec<_>>(), n
                     ))
                 }
                 _ => {}

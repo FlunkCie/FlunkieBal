@@ -193,9 +193,27 @@ impl Out {
         if !self.room_set {
             self.room_set = true;
             let ir = impulse(self.room.0, self.room.1);
-            if let Ok(b) = g.ctx.create_buffer(2, ir.len() as u32, RATE) {
-                let _ = b.copy_to_channel(&ir.l, 0);
-                let _ = b.copy_to_channel(&ir.r, 1);
+            // a convolver takes only the context's own sample rate (Firefox throws otherwise, and a throwing
+            // setter stops the game): the reverb's tail is resampled to it
+            let rate = g.ctx.sample_rate();
+            let resample = |x: &[f32]| -> Vec<f32> {
+                if (rate - RATE).abs() < 1.0 {
+                    return x.to_vec();
+                }
+                let n = (x.len() as f32 * rate / RATE) as usize;
+                (0..n)
+                    .map(|i| {
+                        let t = i as f32 * RATE / rate;
+                        let (k, f) = (t as usize, t.fract());
+                        let a = x.get(k).copied().unwrap_or(0.0);
+                        a + (x.get(k + 1).copied().unwrap_or(0.0) - a) * f
+                    })
+                    .collect()
+            };
+            let (l, r) = (resample(&ir.l), resample(&ir.r));
+            if let Ok(b) = g.ctx.create_buffer(2, l.len().max(1) as u32, rate) {
+                let _ = b.copy_to_channel(&l, 0);
+                let _ = b.copy_to_channel(&r, 1);
                 g.verb.set_buffer(Some(&b));
             }
         }

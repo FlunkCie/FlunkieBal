@@ -154,15 +154,83 @@ fn fs_shadow(i: ShOut) {
   if (i32(i.params.x + 0.5) == 14 && leaf_mask(i.uv) < 0.0) { discard; }
 }
 
+// ---------- the park's plants and stones (`nature`) ----------
+@group(1) @binding(0) var nat_tex: texture_2d_array<f32>;
+@group(1) @binding(1) var nat_smp: sampler;
+struct NIn {
+  @location(0) pos: vec3<f32>,
+  @location(1) nrm: vec3<f32>,
+  @location(2) uv: vec2<f32>,
+  @location(9) col: vec3<f32>,
+  @location(10) ls: vec2<f32>, // texture layer, how much the wind moves it
+  @location(3) m0: vec4<f32>,
+  @location(4) m1: vec4<f32>,
+  @location(5) m2: vec4<f32>,
+  @location(6) m3: vec4<f32>,
+  @location(7) color: vec4<f32>,
+  @location(8) params: vec4<f32>,
+};
+fn nature_pos(v: NIn) -> vec4<f32> {
+  let m = mat4x4<f32>(v.m0, v.m1, v.m2, v.m3);
+  var w = m * vec4<f32>(v.pos, 1.0);
+  // the wind: more the higher up a leaf or blade is; each plant a little out of step
+  let wv = wind(w.xz, g.misc.x + v.params.w) * v.ls.y * 0.18 * length(v.m1.xyz);
+  w = vec4<f32>(w.x + wv.x, w.y, w.z + wv.y, w.w);
+  return w;
+}
+@vertex
+fn vs_nature(v: NIn) -> VOut {
+  let w = nature_pos(v);
+  let c0 = v.m0.xyz; let c1 = v.m1.xyz; let c2 = v.m2.xyz;
+  let nm = mat3x3<f32>(cross(c1, c2), cross(c2, c0), cross(c0, c1));
+  var o: VOut;
+  o.clip = g.view_proj * w;
+  o.wpos = w.xyz;
+  o.nrm = nm * v.nrm;
+  o.uv = v.uv;
+  o.color = vec4<f32>(v.col * v.color.rgb, 1.0);
+  o.params = vec4<f32>(v.ls.x, v.ls.y, 0.0, 0.0);
+  return o;
+}
+@fragment
+fn fs_nature(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
+  let tx = textureSample(nat_tex, nat_smp, i.uv, i32(i.params.x + 0.5));
+  if (tx.a < 0.5) { discard; }
+  var n = normalize(i.nrm);
+  if (!ff) { n = -n; }
+  let p = i.wpos;
+  let base = tx.rgb * i.color.rgb;
+  // leaves and blades let some light through from behind
+  let trans = select(0.0, 0.35, i.params.y > 0.0 || i32(i.params.x + 0.5) == 2 || i32(i.params.x + 0.5) == 3);
+  let col = shade(Surf(base, n, 0.85, 0.03, room_ao(p, n), trans), p);
+  return finish(fogged(col, p), 1.0);
+}
+struct NShOut { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) @interpolate(flat) layer: f32 };
+@vertex
+fn vs_nature_shadow(v: NIn) -> NShOut {
+  var o: NShOut;
+  o.clip = g.light_vp * nature_pos(v);
+  o.uv = v.uv;
+  o.layer = v.ls.x;
+  return o;
+}
+@fragment
+fn fs_nature_shadow(i: NShOut) {
+  if (textureSample(nat_tex, nat_smp, i.uv, i32(i.layer + 0.5)).a < 0.5) { discard; }
+}
+
 // ---------- skinned people ----------
-struct Skin { bones: array<mat4x4<f32>, 32>, colors: array<vec4<f32>, 6>, misc: vec4<f32> };
+struct Skin { bones: array<mat4x4<f32>, 32>, colors: array<vec4<f32>, 8>, misc: vec4<f32> };
 @group(1) @binding(0) var<uniform> sk: Skin;
+@group(1) @binding(1) var people_tex: texture_2d<f32>;
+@group(1) @binding(2) var people_smp: sampler;
 struct SIn {
   @location(0) pos: vec3<f32>,
   @location(1) nrm: vec3<f32>,
   @location(2) joints: vec4<f32>,
   @location(3) weights: vec4<f32>,
-  @location(4) mat: f32,
+  @location(4) uv: vec2<f32>,
+  @location(5) slot: f32,
 };
 fn skin_m(v: SIn) -> mat4x4<f32> {
   let j = vec4<u32>(v.joints + vec4<f32>(0.5));
@@ -172,18 +240,42 @@ fn skin_m(v: SIn) -> mat4x4<f32> {
 fn vs_skin(v: SIn) -> VOut {
   let m = skin_m(v);
   let w = m * vec4<f32>(v.pos, 1.0);
-  let mi = u32(v.mat + 0.5);
   var o: VOut;
   o.clip = g.view_proj * w;
   o.wpos = w.xyz;
   o.nrm = (m * vec4<f32>(v.nrm, 0.0)).xyz;
-  o.uv = vec2<f32>(v.pos.x * sk.misc.x + 0.25, 0.0);
-  o.color = sk.colors[mi];
-  var stripes = 0.0;
-  if (mi == 0u && sk.misc.x > 0.0) { stripes = 1.0; }
-  // material id rides in params.y's fraction-free slot: skin (1) is a bit glossier than cloth
-  o.params = vec4<f32>(0.0, 0.0, 1.0, stripes);
+  o.uv = v.uv;
+  // color: the person's colour these texels may take (a = 1), see `fs_person`; on the referee's shirt
+  // a is 2 + where across the stripes it is
+  let slot = u32(v.slot + 0.5);
+  o.color = vec4<f32>(1.0, 1.0, 1.0, 0.0);
+  if (slot < 8u) { o.color = vec4<f32>(sk.colors[slot].rgb, 1.0); }
+  if (slot == 0u && sk.misc.x > 0.0) { o.color.a = 2.0 + v.pos.x * sk.misc.x + 64.25; }
+  // params.z: how rough (skin has a little shine)
+  var rough = 0.75;
+  if (slot == 1u) { rough = 0.5; }
+  o.params = vec4<f32>(0.0, 0.0, rough, 0.0);
   return o;
+}
+// People: their texture, where its alpha says so tinted by one of their colours (the texel then holds a
+// shade, 0.5 = the colour itself), lit like everything else, with a soft rim of sky light along their outline.
+@fragment
+fn fs_person(i: VOut) -> @location(0) vec4<f32> {
+  let n = normalize(i.nrm);
+  let p = i.wpos;
+  let tx = textureSample(people_tex, people_smp, i.uv);
+  var base = tx.rgb;
+  if (i.color.a > 0.5) {
+    var tint = i.color.rgb;
+    if (i.color.a > 1.5 && fract(i.color.a) < 0.5) { tint = vec3<f32>(0.03, 0.03, 0.035); } // the referee's stripes
+    base = mix(tx.rgb, tx.rgb * 2.0 * tint, tx.a);
+  }
+  var col = shade(Surf(base, n, i.params.z, 0.04, room_ao(p, n), 0.0), p);
+  let v = normalize(g.cam_pos.xyz - p);
+  let ndv = max(dot(n, v), 0.0);
+  let sky = mix(g.ground_col.rgb, g.sky_top.rgb, n.y * 0.4 + 0.6);
+  col = col + (base * 0.5 + vec3<f32>(0.5)) * sky * g.misc.w * pow(1.0 - ndv, 3.0) * 0.25;
+  return finish(fogged(col, p), 1.0);
 }
 @vertex
 fn vs_skin_shadow(v: SIn) -> @builtin(position) vec4<f32> {

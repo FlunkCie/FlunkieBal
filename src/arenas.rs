@@ -285,6 +285,7 @@ impl Env {
         dl.opaque.extend_from_slice(&self.list.opaque);
         dl.blend.extend_from_slice(&self.list.blend);
         dl.add.extend_from_slice(&self.list.add);
+        dl.nature.extend_from_slice(&self.list.nature);
         for w in &self.walls {
             if w.n.dot(cam) + w.d > 0.0 {
                 dl.opaque.extend_from_slice(&w.list.opaque);
@@ -1286,6 +1287,9 @@ fn moved(mut e: Env, by: Vec3) -> Env {
                 i.m = (m * Mat4::from_cols_array_2d(&i.m)).to_cols_array_2d();
             }
         }
+        for (_, i) in dl.nature.iter_mut() {
+            i.m = (m * Mat4::from_cols_array_2d(&i.m)).to_cols_array_2d();
+        }
     };
     shift(&mut e.list);
     for w in e.walls.iter_mut() {
@@ -1304,6 +1308,7 @@ fn build_clubhouse() -> Env {
     e.list.opaque.extend(hub.list.opaque);
     e.list.blend.extend(hub.list.blend);
     e.list.add.extend(hub.list.add);
+    e.list.nature.extend(hub.list.nature);
     // the shed's back wall is shared with the hall: it is never cut away, or you would see the
     // back of the chalkboard from the hall
     for w in hub.walls {

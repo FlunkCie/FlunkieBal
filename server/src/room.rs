@@ -81,6 +81,10 @@ pub struct Room {
     pub empty_since: Option<Instant>,
     /// the match that just ended, for the hub to file
     pub finished: Option<crate::social::Finished>,
+    /// the bet, in coins each (0: none), and what was put in for the match running now:
+    /// (friend code, seat, team, coins)
+    pub stake: u32,
+    pub bets: Vec<(String, u32, u8, u32)>,
     last_thrower: Option<u32>,
     game: Game,
     log: EvLog,
@@ -103,7 +107,7 @@ pub fn out(m: &FromServer) -> String {
 
 impl Room {
     pub fn new(code: String, host: u32, seed: u64) -> Room {
-        Room { code, host, open: false, arena: "vondel".into(), diff: 1, phase: PHASE_LOBBY, seats: Vec::new(), empty_since: None, finished: None, last_thrower: None, game: Game::new(seed), log: EvLog::default(), match_id: seed as u32 & 0xffff, seq: 0, snap_acc: 0.0, now: 0.0, started: Instant::now(), pause: None, aim_t: 0.0, digests: VecDeque::new(), matches_played: 0, status_acc: 0.0, roster_dirty: false }
+        Room { code, host, open: false, arena: "vondel".into(), diff: 1, phase: PHASE_LOBBY, seats: Vec::new(), empty_since: None, finished: None, stake: 0, bets: Vec::new(), last_thrower: None, game: Game::new(seed), log: EvLog::default(), match_id: seed as u32 & 0xffff, seq: 0, snap_acc: 0.0, now: 0.0, started: Instant::now(), pause: None, aim_t: 0.0, digests: VecDeque::new(), matches_played: 0, status_acc: 0.0, roster_dirty: false }
     }
     pub fn host_name(&self) -> String {
         self.seats.iter().find(|s| s.m.id == self.host).map_or(String::new(), |s| s.m.name.clone())
@@ -140,7 +144,7 @@ impl Room {
     }
     pub fn roster(&mut self) {
         self.roster_dirty = false;
-        let m = FromServer::Roster { members: self.members(), host: self.host, arena: self.arena.clone(), diff: self.diff, phase: self.phase, open: self.open };
+        let m = FromServer::Roster { members: self.members(), host: self.host, arena: self.arena.clone(), diff: self.diff, phase: self.phase, open: self.open, stake: self.stake };
         self.all(&m);
     }
     pub fn notice(&self, title: impl Into<String>, sub: impl Into<String>) {
@@ -148,10 +152,10 @@ impl Room {
     }
 
     // ---------- people coming and going ----------
-    pub fn add_seat(&mut self, id: u32, name: String, look: [u8; 7], token: String, conn: Conn) {
+    pub fn add_seat(&mut self, id: u32, name: String, look: [u8; 7], wear: [u8; 8], token: String, conn: Conn) {
         // join the smaller team
         let t = if team_of(&self.members(), 1).len() <= team_of(&self.members(), 0).len() && !self.seats.is_empty() { 1 } else { 0 };
-        self.seats.push(Seat { m: Member { id, name, team: t, look, away: false }, token, conn: Some(conn), last_heard: Instant::now(), gone_at: None, rtt: 0.0, ack: 0, hold: false, account: None, throws: 0, hits: 0, emoted: None, in_match: false, tap_off: None, pause_used: 0.0, away_told: false, slow_told: false, desyncs: 0, desync_run: 0, rejected: 0, late_snaps: 0, rtt_max: 0.0 });
+        self.seats.push(Seat { m: Member { id, name, team: t, look, wear, away: false }, token, conn: Some(conn), last_heard: Instant::now(), gone_at: None, rtt: 0.0, ack: 0, hold: false, account: None, throws: 0, hits: 0, emoted: None, in_match: false, tap_off: None, pause_used: 0.0, away_told: false, slow_told: false, desyncs: 0, desync_run: 0, rejected: 0, late_snaps: 0, rtt_max: 0.0 });
         self.empty_since = None;
         self.roster();
     }
@@ -301,15 +305,34 @@ impl Room {
         }
         self.roster();
     }
-    pub fn config(&mut self, id: u32, arena: String, diff: u8) {
+    pub fn config(&mut self, id: u32, arena: String, diff: u8, stake: u32) {
         if id != self.host || self.phase == PHASE_PLAYING {
             return;
         }
         if ARENAS.contains(&arena.as_str()) {
             self.arena = arena;
         }
+        if STAKES.contains(&stake) {
+            self.stake = stake;
+        }
         self.diff = diff.min(2);
         self.roster();
+    }
+    /// Who bets in the next match, if it has a bet: (friend code, seat, team, name). Everyone must
+    /// have an account, each one only once, with people on both teams.
+    pub fn bettors(&self) -> Result<Vec<(String, u32, u8, String)>, String> {
+        let mut out: Vec<(String, u32, u8, String)> = Vec::new();
+        for s in &self.seats {
+            let Some(a) = s.account.clone() else { return Err(format!("{} isn't logged in, so can't bet", s.m.name)) };
+            if out.iter().any(|o| o.0 == a) {
+                return Err(format!("{} is in here twice", s.m.name));
+            }
+            out.push((a, s.m.id, s.m.team, s.m.name.clone()));
+        }
+        if !(out.iter().any(|o| o.2 == 0) && out.iter().any(|o| o.2 == 1)) {
+            return Err("A bet needs people on both teams".into());
+        }
+        Ok(out)
     }
     pub fn start(&mut self, id: u32) {
         if id != self.host {
@@ -328,6 +351,7 @@ impl Room {
         self.phase = PHASE_PLAYING;
         self.started = Instant::now();
         self.matches_played += 1;
+        self.bets.clear();
         for s in self.seats.iter_mut() {
             s.pause_used = 0.0;
             s.hold = false;
@@ -660,6 +684,8 @@ impl Room {
                     seconds: self.started.elapsed().as_secs() as u32,
                     winner: w as u8,
                     players: self.seats.iter().filter(|s| s.in_match).filter_map(|s| s.account.clone().map(|c| (c, s.m.team, s.throws, s.hits))).collect(),
+                    // who left during the match has lost their bet
+                    bets: std::mem::take(&mut self.bets).into_iter().map(|(c, seat, t, n)| (c, t, n, self.seats.iter().any(|s| s.m.id == seat))).collect(),
                 });
                 let g = &self.game;
                 let dur = self.started.elapsed().as_secs();

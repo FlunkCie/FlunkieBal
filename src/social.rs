@@ -3,7 +3,7 @@
 //! Where logging in is needed (`save::needs_login`) it's also the way in: a login or sign-up, then the
 //! session kept in the save; logged out, it stays closed.
 
-use crate::net::{ChatMsg, Friend, FromServer, Note, PairStats, Socket, ToServer, PROTOCOL};
+use crate::net::{BoardRow, ChatMsg, Friend, FromServer, Note, PairStats, Socket, ToServer, PROTOCOL};
 use std::collections::HashMap;
 
 /// Nothing from the server for this long: the connection is dead, whatever the socket says.
@@ -19,6 +19,8 @@ pub enum Got {
     Me { code: String, secret: String, user: String, name: String },
     /// the progression the server keeps for this account
     Progress { rev: u64, data: String },
+    /// coins and hats bought, kept on the server; `gain` and `why`: what changed, to say so
+    Wallet { coins: u32, owned: Vec<u8>, gain: i64, why: String },
     /// the kept session is gone
     LoggedOut,
 }
@@ -72,6 +74,12 @@ pub struct Social {
     pub bug_busy: bool,
     pub bug_res: Option<(bool, String)>,
     bug_at: f64,
+    /// the leaderboards that came in, by `BOARD_*`: the top, and our own line
+    pub boards: HashMap<u8, (Vec<BoardRow>, Option<BoardRow>)>,
+    /// a purchase on its way
+    pub buying: bool,
+    /// the leaderboard last asked for, asked again once connected
+    board_want: Option<u8>,
 }
 
 impl Social {
@@ -107,6 +115,16 @@ impl Social {
         self.open_stats = Some(code.to_string());
         self.err.clear();
         self.send(ToServer::FriendStats { with: code.into() });
+    }
+    /// Ask for a leaderboard (it comes in `boards`).
+    pub fn ask_board(&mut self, by: u8) {
+        self.board_want = Some(by);
+        self.send(ToServer::Board { by });
+    }
+    pub fn buy(&mut self, item: u8) {
+        self.err.clear();
+        self.buying = true;
+        self.send(ToServer::Buy { item });
     }
     pub fn say_open_chat(&mut self) {
         let text = self.say_in.trim().to_string();
@@ -235,6 +253,9 @@ impl Social {
                     if let Some(c) = self.open_chat.clone() {
                         self.send(ToServer::ChatOpen { with: c });
                     }
+                    if let Some(by) = self.board_want {
+                        self.send(ToServer::Board { by });
+                    }
                 }
                 FromServer::Friends { friends, requests, sent } => {
                     self.friends = friends;
@@ -272,6 +293,13 @@ impl Social {
                     self.stats.insert(with, s);
                 }
                 FromServer::Progress { rev, data } => got.push(Got::Progress { rev, data }),
+                FromServer::Wallet { coins, owned, gain, why } => {
+                    self.buying = false;
+                    got.push(Got::Wallet { coins, owned, gain, why });
+                }
+                FromServer::Board { by, rows, me } => {
+                    self.boards.insert(by, (rows, me));
+                }
                 FromServer::AuthErr { msg } => {
                     // whatever it was, this connection is no one: close it, and try again only when asked
                     let was_session = !self.busy;
@@ -282,7 +310,10 @@ impl Social {
                     }
                     return got;
                 }
-                FromServer::SocialErr { msg } => self.err = msg,
+                FromServer::SocialErr { msg } => {
+                    self.buying = false;
+                    self.err = msg;
+                }
                 FromServer::Err { msg, fatal } => {
                     if self.busy {
                         self.busy = false;
